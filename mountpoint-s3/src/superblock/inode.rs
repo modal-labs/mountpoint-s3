@@ -455,7 +455,8 @@ impl WriteHandle {
         is_truncate: bool,
     ) -> Result<Self, InodeError> {
         let mut state = inode.get_mut_inode_state()?;
-        if state.reader_count > 0 {
+        // TODO(Jonathon): return back to '> 0' when github.com/google/gvisor/issues/10385 is resolved.
+        if state.reader_count > 1 {
             return Err(InodeError::InodeNotWritableWhileReading(inode.err()));
         }
         match state.write_status {
