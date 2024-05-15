@@ -717,8 +717,9 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         trace!(?ino, "write");
         let inode = self.inner.get(ino)?;
 
+        // TODO(Jonathon): return back to '> 0' when github.com/google/gvisor/issues/10385 is resolved.
         let mut state = inode.get_mut_inode_state()?;
-        if self.inner.reader_counts.read().unwrap().has_readers(&state) {
+        if self.inner.reader_counts.read().unwrap().num_readers(&state) > 1 {
             return Err(InodeError::InodeNotWritableWhileReading(inode.err()));
         }
 
@@ -1765,6 +1766,10 @@ impl ReaderCountMap {
     fn has_readers(&self, locked_inode: &InodeLockedForWriting) -> bool {
         // Suffices we only store non-zero counts
         self.map.contains_key(&locked_inode.ino)
+    }
+
+    fn num_readers(&self, locked_inode: &InodeLockedForWriting) -> u32 {
+        self.map.entry(&locked_inode.ino).or_default()
     }
 
     fn add_reader(&mut self, locked_inode: &InodeLockedForWriting) {
@@ -2872,7 +2877,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Should get an error back when calling setattr
+        // Should get an error back when calling setattr (setattr patch not applied in this branch)
         let result = superblock.setattr(new_inode.ino(), Some(atime), Some(mtime)).await;
         assert!(matches!(result, Err(InodeError::SetAttrNotPermittedOnRemoteInode(_))));
     }
