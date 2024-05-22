@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [profile.release]
-debug = 2
+debug = 0         # Modal specific: upstream has '2' for some reason
 opt-level = 3
 lto = true # Link-time optimization
 codegen-units = 1  # Single compilation unit for better optimization
