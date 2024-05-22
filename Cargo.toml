@@ -11,4 +11,3 @@ resolver = "2"
 [profile.release]
 debug = 0  # upstream has '2' for some reason
 lto = true  # reduces bin size; also slows link-time, but we don't build often
-strip = true  # automatically strip symbols from the binary.
