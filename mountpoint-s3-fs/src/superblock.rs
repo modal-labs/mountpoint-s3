@@ -684,8 +684,14 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         logging::record_name(inode.name());
         let mut sync = inode.get_mut_inode_state()?;
 
+        // If the inode is remote, we would typically throw an error here, but instead we
+        // silently fail and return the current stat. This allows programs like `wget` to
+        // continue working.
         if sync.write_status == WriteStatus::Remote {
-            return Err(InodeError::SetAttrNotPermittedOnRemoteInode(inode.err()));
+            let stat = sync.stat.clone();
+            drop(sync);
+            let path = self.inner.s3_path.clone();
+            return Ok(LookedUpInode { inode, stat, path }.into());
         }
 
         let validity = match inode.kind() {
@@ -1769,7 +1775,7 @@ impl ReaderCountMap {
     }
 
     fn num_readers(&self, locked_inode: &InodeLockedForWriting) -> u32 {
-        self.map.entry(&locked_inode.ino).or_default()
+        self.map.get(&locked_inode.ino).copied().unwrap_or_default()
     }
 
     fn add_reader(&mut self, locked_inode: &InodeLockedForWriting) {
@@ -2877,9 +2883,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Should get an error back when calling setattr (setattr patch not applied in this branch)
-        let result = superblock.setattr(new_inode.ino(), Some(atime), Some(mtime)).await;
-        assert!(matches!(result, Err(InodeError::SetAttrNotPermittedOnRemoteInode(_))));
+        // Should not get an error back when calling setattr now that we've patched the code to allow this.
+        let result = superblock
+            .setattr(new_inode.inode.ino(), Some(atime), Some(mtime))
+            .await;
+        assert!(matches!(result, Ok(_)));
     }
 
     #[test]
