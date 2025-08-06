@@ -701,7 +701,7 @@ where
                     }
                 });
 
-                let timeout = Duration::from_secs(30);
+                let timeout = Duration::from_secs(60);
                 tracing::debug!(
                     "waiting up to {} seconds for child process to be ready",
                     timeout.as_secs(),
