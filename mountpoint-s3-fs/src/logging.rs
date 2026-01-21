@@ -41,6 +41,8 @@ use self::syslog::SyslogLayer;
 pub struct LoggingConfig {
     /// File to write logs into. If unspecified, logs will be routed to syslog.
     pub log_file: Option<PathBuf>,
+    /// File permissions for log file.
+    pub log_file_mode: Option<u32>,
     /// Whether to duplicate logs to stdout in addition to syslog or the log directory.
     pub log_to_stdout: bool,
     /// The default filter directive (in the sense of [tracing_subscriber::filter::EnvFilter]) to
@@ -141,7 +143,8 @@ fn init_tracing_subscriber(config: LoggingConfig) -> anyhow::Result<LoggingHandl
         let mut dir_builder = DirBuilder::new();
         dir_builder.recursive(true).mode(0o750);
         let mut file_options = OpenOptions::new();
-        file_options.mode(0o640).append(true).create(true);
+        let file_mode = config.log_file_mode.unwrap_or(0o640);
+        file_options.mode(file_mode).append(true).create(true);
 
         if let Some(parent_dir) = log_file_path.parent() {
             dir_builder.create(parent_dir).context("failed to create log folder")?;

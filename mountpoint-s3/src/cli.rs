@@ -277,6 +277,14 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
     )]
     pub log_directory: Option<PathBuf>,
 
+    #[clap(
+        long,
+        help = "Log file permissions [default: 0640]",
+        value_parser = parse_perm_bits,
+        help_heading = LOGGING_OPTIONS_HEADER
+    )]
+    pub log_file_mode: Option<u16>,
+
     #[clap(long, help = "Enable logging of summarized performance metrics", help_heading = LOGGING_OPTIONS_HEADER)]
     pub log_metrics: bool,
 
@@ -681,9 +689,11 @@ impl CliArgs {
         };
 
         let log_file = self.log_directory.as_ref().map(|dir| prepare_log_file_name(dir));
+        let log_file_mode = self.log_file_mode.map(|log_file_mode| log_file_mode.into());
 
         LoggingConfig {
             log_file,
+            log_file_mode,
             log_to_stdout: self.foreground,
             default_filter,
         }
