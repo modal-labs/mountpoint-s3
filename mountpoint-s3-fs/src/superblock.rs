@@ -1077,6 +1077,7 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             }
         };
 
+        self.inner.negative_cache.remove(dir, &name);
         self.inner.remember(&lookup.inode);
         Ok(lookup.into())
     }
