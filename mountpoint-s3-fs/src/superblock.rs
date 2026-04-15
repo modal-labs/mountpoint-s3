@@ -353,6 +353,13 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         dst_name: &OsStr,
         allow_overwrite: bool,
     ) -> Result<(), InodeError> {
+        // RenameObject is only supported on S3 Express One Zone directory
+        // buckets. Non-Express backends (including MinIO) silently accept the
+        // PUT ?renameObject request as a regular PutObject, producing a
+        // corrupt/empty target while leaving the source intact.
+        if !self.inner.config.s3_personality.supports_rename_object() {
+            return Err(InodeError::RenameNotSupported());
+        }
         // If we have cached a failed rename, we will directly fail
         if !self.inner.cached_rename_support.should_try_rename() {
             trace!("Cached rename failure, returning NotSupported");
