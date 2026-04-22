@@ -1414,6 +1414,11 @@ fn try_parse_generic_error(request_result: &MetaRequestResult) -> Option<S3Reque
         // redirect
         400 => try_parse_forbidden(request_result).or_else(|| try_parse_redirect(request_result)),
         403 => try_parse_forbidden(request_result),
+        // HTTP 429 is the standard rate-limiting status code. S3-compatible
+        // backends like Cloudflare R2 return 429 for bandwidth throttling
+        // instead of S3's usual 503 SlowDown. Treat it identically so the CRT
+        // retry strategy can back off and retry.
+        429 => Some(S3RequestError::Throttled),
         // if the http response status is not set, we look into crt_error_code to identify the error
         0 => try_parse_throttled(request_result)
             .or_else(|| try_parse_canceled_request(request_result))
@@ -1875,6 +1880,18 @@ mod tests {
             panic!("wrong result, got: {result:?}");
         };
         assert_eq!(message, "This error is made up.");
+    }
+
+    #[test]
+    fn parse_429_throttled() {
+        // Cloudflare R2 returns HTTP 429 with ServiceUnavailable for bandwidth throttling
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>ServiceUnavailable</Code><Message>You have exceeded your available bandwidth limit.</Message></Error>"#;
+        let result = make_result(429, OsStr::from_bytes(&body[..]), None);
+        let result = try_parse_generic_error(&result);
+        assert!(
+            matches!(result, Some(S3RequestError::Throttled)),
+            "expected Throttled, got: {result:?}",
+        );
     }
 
     fn make_crt_error_result(response_status: i32, crt_error: Error) -> MetaRequestResult {
