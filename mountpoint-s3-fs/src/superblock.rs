@@ -2893,7 +2893,7 @@ mod tests {
 
         // Should not get an error back when calling setattr now that we've patched the code to allow this.
         let result = superblock
-            .setattr(new_inode.inode.ino(), Some(atime), Some(mtime))
+            .setattr(new_inode.ino(), Some(atime), Some(mtime))
             .await;
         assert!(matches!(result, Ok(_)));
     }
