@@ -271,14 +271,14 @@ fn write_errors_test(creator_fn: impl TestSessionCreator, upload_mode: UploadMod
         .expect_err("write to an existing file should fail");
     assert_eq!(err.raw_os_error(), Some(libc::EBADF));
 
-    // For default config, existing files cannot be opened with O_TRUNC
-    let err = File::options()
+    // With the relaxed reader constraint (> 1 instead of > 0), a single
+    // reader no longer blocks truncate-open on existing remote files.
+    File::options()
         .read(true)
         .write(true)
         .truncate(true)
         .open(&existing_file_path)
-        .expect_err("existing file cannot be opened with O_TRUNC");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        .expect("opening existing file with O_TRUNC should succeed with <= 1 reader");
 }
 
 #[cfg(feature = "s3_tests")]
@@ -990,13 +990,14 @@ fn overwrite_disallowed_on_concurrent_read_test(creator_fn: impl TestSessionCrea
         .expect_err("writing to a file is being read should fail");
     assert_eq!(err.raw_os_error(), Some(libc::EBADF));
 
+    // With the relaxed reader constraint (> 1 instead of > 0), a single
+    // reader no longer blocks truncate-open.
     let mut options = File::options();
-    let err = options
+    options
         .write(true)
         .truncate(true)
         .open(&path)
-        .expect_err("opening a file for write while it is being read should fail");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        .expect("opening file for write while it has one reader should succeed");
 
     drop(fh);
 }

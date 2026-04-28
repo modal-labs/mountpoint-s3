@@ -53,13 +53,12 @@ fn setattr_test(creator_fn: impl TestSessionCreator, prefix: &str, append: bool)
     f.sync_all().unwrap();
     drop(f);
 
-    // Verify that we get an error when setting time attributes for remote files
-    let err = filetime::set_file_atime(&path, FileTime::from_system_time(expected_atime))
-        .expect_err("set atime should fail on remote files");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
-    let err = filetime::set_file_mtime(&path, FileTime::from_system_time(expected_mtime))
-        .expect_err("set mtime should fail on remote files");
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    // Setting time attributes on remote files silently succeeds (no-op) to
+    // allow programs like `wget` to work.
+    filetime::set_file_atime(&path, FileTime::from_system_time(expected_atime))
+        .expect("set atime should silently succeed on remote files");
+    filetime::set_file_mtime(&path, FileTime::from_system_time(expected_mtime))
+        .expect("set mtime should silently succeed on remote files");
 }
 
 #[cfg(feature = "s3_tests")]
