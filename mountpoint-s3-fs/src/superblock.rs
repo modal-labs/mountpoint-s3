@@ -1777,6 +1777,7 @@ struct ReaderCountMap {
 }
 
 impl ReaderCountMap {
+    #[allow(dead_code)]
     fn has_readers(&self, locked_inode: &InodeLockedForWriting) -> bool {
         // Suffices we only store non-zero counts
         self.map.contains_key(&locked_inode.ino)
@@ -2892,10 +2893,8 @@ mod tests {
             .unwrap();
 
         // Should not get an error back when calling setattr now that we've patched the code to allow this.
-        let result = superblock
-            .setattr(new_inode.ino(), Some(atime), Some(mtime))
-            .await;
-        assert!(matches!(result, Ok(_)));
+        let result = superblock.setattr(new_inode.ino(), Some(atime), Some(mtime)).await;
+        assert!(result.is_ok());
     }
 
     #[test]
