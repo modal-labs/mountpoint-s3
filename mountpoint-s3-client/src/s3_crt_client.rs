@@ -1424,10 +1424,7 @@ fn try_parse_generic_error(request_result: &MetaRequestResult) -> Option<S3Reque
                 .as_ref()
                 .and_then(|body| xmltree::Element::parse(body.as_bytes()).ok())
                 .map(|root| {
-                    let code = root
-                        .get_child("Code")
-                        .and_then(|e| e.get_text())
-                        .map(|s| s.to_string());
+                    let code = root.get_child("Code").and_then(|e| e.get_text()).map(|s| s.to_string());
                     let message = root
                         .get_child("Message")
                         .and_then(|e| e.get_text())
