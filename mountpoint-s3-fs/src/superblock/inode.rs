@@ -568,6 +568,8 @@ mod tests {
     mod shuttle_tests {
         use super::*;
         use crate::fs::FUSE_ROOT_INODE;
+        use crate::s3::S3Personality;
+        use crate::superblock::SuperblockConfig;
         use mountpoint_s3_client::mock_client::MockClient;
         use shuttle::{check_dfs, check_pct, check_random, thread};
         use shuttle::{future::block_on, sync::Arc};
@@ -631,10 +633,14 @@ mod tests {
                 );
 
                 // Create directories first
+                let config = SuperblockConfig {
+                    s3_personality: S3Personality::ExpressOneZone,
+                    ..Default::default()
+                };
                 let superblock = Arc::new(Superblock::new(
                     client.clone(),
                     S3Path::new(bucket, Default::default()),
-                    Default::default(),
+                    config,
                 ));
 
                 // Create initial files and directories
@@ -733,11 +739,11 @@ mod tests {
                 let dest_name = "dest";
                 client.add_object(dest_name, b"dest".into());
 
-                let superblock = Arc::new(Superblock::new(
-                    client,
-                    S3Path::new(bucket, Default::default()),
-                    Default::default(),
-                ));
+                let config = SuperblockConfig {
+                    s3_personality: S3Personality::ExpressOneZone,
+                    ..Default::default()
+                };
+                let superblock = Arc::new(Superblock::new(client, S3Path::new(bucket, Default::default()), config));
                 // Create two threads, one that renames and one that tries to open the destination
                 let superblock_clone1 = superblock.clone();
                 let dest_lookup = superblock.lookup(ROOT_INODE_NO, dest_name.as_ref()).await.unwrap();

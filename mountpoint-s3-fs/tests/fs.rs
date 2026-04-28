@@ -1670,13 +1670,13 @@ async fn test_rename_support_is_cached() {
 
     let counter = client.new_counter(Operation::RenameObject);
     // Try to rename twice
-    let fs = make_test_filesystem_with_client(
-        client.clone(),
-        pool,
-        BUCKET_NAME,
-        &Default::default(),
-        Default::default(),
-    );
+    // Use ExpressOneZone personality so the rename passes the personality check
+    // and actually reaches the client (which has rename disabled).
+    let fs_config = S3FilesystemConfig {
+        s3_personality: S3Personality::ExpressOneZone,
+        ..Default::default()
+    };
+    let fs = make_test_filesystem_with_client(client.clone(), pool, BUCKET_NAME, &Default::default(), fs_config);
     let err = fs
         .rename(
             FUSE_ROOT_INODE,
