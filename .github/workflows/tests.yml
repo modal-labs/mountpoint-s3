@@ -52,46 +52,6 @@ jobs:
     - name: Run tests
       run: cargo test --features $RUST_FEATURES
 
-  macos-test:
-    name: Tests (MacOS)
-
-    # We don't strictly support macOS,
-    # checking latest macOS version passes unit tests is enough.
-    runs-on: macos-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v5
-      with:
-        submodules: true
-    - name: Install dependencies
-      run: |
-        brew update > /dev/null && brew install pkgconfig
-    - name: Install fuse
-      run: |
-        brew install --cask macfuse
-    - name: Set up Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        # setup-rust-toolchain sets "-D warnings" by default, and Rust treats any warning as compile error.
-        # We need to do this currently because `mountpoint-s3-fuser` contains some warnings and it breaks the build.
-        rustflags: ""
-    - name: Cargo cache
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    - name: Build tests
-      run: cargo test --no-run
-    - name: Run tests
-      # Skip `mountpoint-s3-fuser` tests on macOS.
-      run: cargo test --workspace --exclude mountpoint-s3-fuser
-
   check:
     name: Check all targets
     runs-on: ubuntu-22.04

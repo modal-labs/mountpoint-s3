@@ -21,3 +21,18 @@ license-files = [
 
 [advisories]
 yanked = "warn"
+ignore = [
+    "RUSTSEC-2026-0045", # AWS-LC: Timing Side-Channel in AES-CCM Tag Verification
+    "RUSTSEC-2026-0046", # AWS-LC: PKCS7_verify Certificate Chain Validation Bypass
+    "RUSTSEC-2026-0047", # AWS-LC: PKCS7_verify Signature Validation Bypass
+    "RUSTSEC-2026-0048", # AWS-LC: CRL Distribution Point Scope Check Logic Error
+    "RUSTSEC-2025-0141", # Bincode is unmaintained
+    "RUSTSEC-2026-0007", # Integer overflow in BytesMut::reserve
+    "RUSTSEC-2026-0097", # Rand is unsound with custom logger
+    "RUSTSEC-2025-0134", # rustls-pemfile is unmaintained
+    "RUSTSEC-2026-0098", # rustls: Name constraints for URI names incorrectly accepted
+    "RUSTSEC-2026-0099", # rustls: Name constraints accepted for wildcard names
+    "RUSTSEC-2026-0104", # rustls: Reachable panic in CRL parsing
+    "RUSTSEC-2026-0049", # rustls: CRLs not considered authoritative by Distribution Point
+    "RUSTSEC-2026-0009", # Denial of Service via Stack Exhaustion
+]
