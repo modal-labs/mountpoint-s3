@@ -1200,7 +1200,7 @@ pub enum S3RequestError {
 
     /// The request was throttled by S3
     #[error("Request throttled")]
-    Throttled,
+    Throttled(ClientErrorMetadata),
 
     /// Cannot fetch more data because current read window is exhausted. The read window must
     /// be advanced using [GetObjectRequest::increment_read_window(u64)] to continue fetching
@@ -1224,11 +1224,7 @@ impl ProvideErrorMetadata for S3RequestError {
         match self {
             Self::ResponseError(request_result) => ClientErrorMetadata::from_meta_request_result(request_result),
             Self::Forbidden(_, metadata) => metadata.clone(),
-            Self::Throttled => ClientErrorMetadata {
-                http_code: Some(503),
-                error_code: Some("SlowDown".to_string()),
-                error_message: Some("Please reduce your request rate.".to_string()),
-            },
+            Self::Throttled(metadata) => metadata.clone(),
             Self::IncorrectRegion(_, metadata) => metadata.clone(),
             _ => Default::default(),
         }
@@ -1397,7 +1393,11 @@ fn try_parse_generic_error(request_result: &MetaRequestResult) -> Option<S3Reque
     fn try_parse_throttled(request_result: &MetaRequestResult) -> Option<S3RequestError> {
         let crt_error_code = request_result.crt_error.raw_error();
         if crt_error_code == mountpoint_s3_crt::s3::ErrorCode::AWS_ERROR_S3_SLOW_DOWN as i32 {
-            Some(S3RequestError::Throttled)
+            Some(S3RequestError::Throttled(ClientErrorMetadata {
+                http_code: Some(503),
+                error_code: Some("SlowDown".to_string()),
+                error_message: Some("Please reduce your request rate.".to_string()),
+            }))
         } else {
             None
         }
@@ -1414,6 +1414,30 @@ fn try_parse_generic_error(request_result: &MetaRequestResult) -> Option<S3Reque
         // redirect
         400 => try_parse_forbidden(request_result).or_else(|| try_parse_redirect(request_result)),
         403 => try_parse_forbidden(request_result),
+        // HTTP 429 is the standard rate-limiting status code. S3-compatible
+        // backends like Cloudflare R2 return 429 for bandwidth throttling
+        // instead of S3's usual 503 SlowDown. Treat it identically so the CRT
+        // retry strategy can back off and retry.
+        429 => {
+            let (error_code, error_message) = request_result
+                .error_response_body
+                .as_ref()
+                .and_then(|body| xmltree::Element::parse(body.as_bytes()).ok())
+                .map(|root| {
+                    let code = root.get_child("Code").and_then(|e| e.get_text()).map(|s| s.to_string());
+                    let message = root
+                        .get_child("Message")
+                        .and_then(|e| e.get_text())
+                        .map(|s| s.to_string());
+                    (code, message)
+                })
+                .unwrap_or((None, None));
+            Some(S3RequestError::Throttled(ClientErrorMetadata {
+                http_code: Some(429),
+                error_code,
+                error_message,
+            }))
+        }
         // if the http response status is not set, we look into crt_error_code to identify the error
         0 => try_parse_throttled(request_result)
             .or_else(|| try_parse_canceled_request(request_result))
@@ -1875,6 +1899,23 @@ mod tests {
             panic!("wrong result, got: {result:?}");
         };
         assert_eq!(message, "This error is made up.");
+    }
+
+    #[test]
+    fn parse_429_throttled() {
+        // Cloudflare R2 returns HTTP 429 with ServiceUnavailable for bandwidth throttling
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>ServiceUnavailable</Code><Message>You have exceeded your available bandwidth limit.</Message></Error>"#;
+        let result = make_result(429, OsStr::from_bytes(&body[..]), None);
+        let result = try_parse_generic_error(&result);
+        let Some(S3RequestError::Throttled(metadata)) = result else {
+            panic!("expected Throttled, got: {result:?}");
+        };
+        assert_eq!(metadata.http_code, Some(429));
+        assert_eq!(metadata.error_code.as_deref(), Some("ServiceUnavailable"));
+        assert_eq!(
+            metadata.error_message.as_deref(),
+            Some("You have exceeded your available bandwidth limit."),
+        );
     }
 
     fn make_crt_error_result(response_status: i32, crt_error: Error) -> MetaRequestResult {
