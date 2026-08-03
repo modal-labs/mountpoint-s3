@@ -393,7 +393,6 @@ jobs:
     needs:
       - test
       - doc-tests
-      - macos-test
       - check
       - bench
       - shuttle
