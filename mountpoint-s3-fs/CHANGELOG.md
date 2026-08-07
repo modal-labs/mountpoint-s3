@@ -1,5 +1,8 @@
 ## Unreleased
 
+* Fix reads of objects with non-standard ETags (for example, Google Cloud Storage composite objects) failing with an I/O error. ([awslabs/aws-c-s3#664](https://github.com/awslabs/aws-c-s3/pull/664))
+* Update to latest CRT dependencies.
+
 ## v0.10.0 (July 20, 2026)
 
 * Add `tls_config` field on `s3::config::ClientConfig` so callers can configure a custom CA trust store through to the underlying S3 client. ([#1834](https://github.com/awslabs/mountpoint-s3/pull/1834))

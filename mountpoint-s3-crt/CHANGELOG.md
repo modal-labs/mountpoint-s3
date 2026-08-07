@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Update to latest CRT dependencies.
+
 ## v0.15.0 (July 20, 2026)
 
 * Add `io::tls` module with safe wrappers around `aws-c-io`'s TLS primitives (`TlsContextOptions`, `TlsContext`, `TlsConnectionOptions`). ([#1834](https://github.com/awslabs/mountpoint-s3/pull/1834))

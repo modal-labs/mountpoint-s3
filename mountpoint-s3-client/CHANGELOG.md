@@ -1,5 +1,8 @@
 ## Unreleased (v0.21.0)
 
+* Fix `GetObject` requests failing with `ResponseHeadersError::MissingHeaders` for objects whose ETag isn't in S3's `<md5>` or `<md5>-<part-count>` format (for example, Google Cloud Storage composite objects accessed through the GCS XML API).
+* Update to latest CRT dependencies.
+
 ## v0.21.0 (July 20, 2026)
 
 ### Breaking changes
