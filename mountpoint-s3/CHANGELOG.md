@@ -1,5 +1,8 @@
 ## Unreleased
 
+* Fix reads of objects with non-standard ETags (for example, Google Cloud Storage composite objects) failing with an I/O error. ([awslabs/aws-c-s3#664](https://github.com/awslabs/aws-c-s3/pull/664))
+* Update the internal S3 client to use the latest release of the AWS Common Runtime (CRT) libraries.
+
 ## v1.23.0 (July 20, 2026)
 
 * Add `--ca-bundle` flag (and `AWS_CA_BUNDLE` environment variable fallback) for trusting a custom certificate authority when Mountpoint makes HTTPS calls. ([#1834](https://github.com/awslabs/mountpoint-s3/pull/1834) by @yerzhan7)
