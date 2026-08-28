@@ -1900,39 +1900,32 @@ fn open_allowed_only_after_all_readers_flushed() {
         .write(true)
         .truncate(true)
         .open(&path)
-        .expect_err("opening a file for write while it is being read should fail");
+        .expect_err("opening a file for write while more than one reader is open should fail");
     assert_eq!(err1.raw_os_error(), Some(libc::EPERM));
 
     drop(fh1);
-    let err2 = File::options()
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .expect_err("opening a file for write while it is being read should fail");
-    assert_eq!(err2.raw_os_error(), Some(libc::EPERM));
 
+    // This fork relaxes Mountpoint's upstream rule (reject a write-open while *any* reader is
+    // open) to "reject only while *more than one* reader is open", working around
+    // google/gvisor#10385 (see the `num_readers` check in superblock.rs). With fh1 dropped, fh2
+    // is the sole remaining reader, so the write-open below succeeds rather than failing.
     let mut dup_fh2 = fh2.try_clone().unwrap();
-    drop(fh2);
 
-    // should be able to read from a flushed handle's duplicate FD
-    dup_fh2.read_to_string(&mut hello_contents).unwrap();
-    // read_to_string already read fh2 until EOF so hello_contents remains unchanged
-    assert_eq!(hello_contents, "hello worldhello world");
-
-    let mut dup2_fh2 = dup_fh2.try_clone().unwrap();
-    drop(dup_fh2);
-
-    // should be able to open a new write handle and write to it after the last open reader flushed
     let mut write_fh = File::options().write(true).truncate(true).open(&path).unwrap();
     write_fh
         .write_all(b"hello world2")
         .expect("writing to a new write file handle should succeed");
 
-    dup2_fh2
-        .read_to_string(&mut hello_contents)
-        .expect_err("reading from an overridden file handle should fail");
+    // fh2 was never released (it stayed open as the sole reader through the write above), so it
+    // keeps reading from the position it was already at: EOF, since it was already read to the
+    // end.
+    fh2.read_to_string(&mut hello_contents).unwrap();
+    assert_eq!(hello_contents, "hello worldhello world");
+    dup_fh2.read_to_string(&mut hello_contents).unwrap();
+    assert_eq!(hello_contents, "hello worldhello world");
 
-    drop(dup2_fh2);
+    drop(fh2);
+    drop(dup_fh2);
     drop(write_fh);
 }
 
