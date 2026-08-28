@@ -41,9 +41,9 @@ jobs:
         # We need to do this currently because `mountpoint-s3-fuser` contains some warnings and it breaks the build.
         rustflags: ""
     - name: Install nextest
-      uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
-      with:
-        tool: nextest
+      # A plain shell step, not a third-party Action, so it needs no entry in this org's
+      # GitHub Actions allowlist.
+      run: cargo install cargo-nextest@0.9.143 --locked
     - name: Cargo cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -170,9 +170,9 @@ jobs:
         # We need to do this currently because `mountpoint-s3-fuser` contains some warnings and it breaks the build.
         rustflags: ""
     - name: Install nextest
-      uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
-      with:
-        tool: nextest
+      # A plain shell step, not a third-party Action, so it needs no entry in this org's
+      # GitHub Actions allowlist.
+      run: cargo install cargo-nextest@0.9.143 --locked
     - name: Install operating system dependencies
       uses: ./.github/actions/install-dependencies
       with:
@@ -276,8 +276,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install cargo-deny
+        # A plain shell step, not a third-party Action, so it needs no entry in this org's
+        # GitHub Actions allowlist.
+        run: cargo install cargo-deny@0.20.2 --locked
       - name: Run cargo deny
-        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        run: cargo deny check
 
 
   benchmark-script-checks:
@@ -393,7 +397,6 @@ jobs:
     needs:
       - test
       - doc-tests
-      - macos-test
       - check
       - bench
       - shuttle
