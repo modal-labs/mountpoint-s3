@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Fix rename and unlink failing on just-closed lockfiles in S3 Express One Zone.
+
 * Fix reads of objects with non-standard ETags (for example, Google Cloud Storage composite objects) failing with an I/O error. ([awslabs/aws-c-s3#664](https://github.com/awslabs/aws-c-s3/pull/664))
 * Update the internal S3 client to use the latest release of the AWS Common Runtime (CRT) libraries.
 
