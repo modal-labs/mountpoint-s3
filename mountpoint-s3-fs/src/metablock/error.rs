@@ -59,6 +59,8 @@ pub enum InodeError {
     },
     #[error("rename is not supported on this bucket")]
     RenameNotSupported(),
+    #[error("inode {0} exceeds the 5 GiB single-copy rename limit")]
+    RenameObjectTooLarge(InodeErrorInfo),
     #[error("S3 key {0:?} was too long")]
     NameTooLong(String),
     #[error("corrupted metadata for inode {0}")]

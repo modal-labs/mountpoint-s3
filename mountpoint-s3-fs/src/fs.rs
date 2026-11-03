@@ -351,7 +351,16 @@ where
         let fh = self.next_handle(); // TODO: can we delay obtaining the next handle until we know we are creating a new file handle?
         let write_mode = self.config.write_mode();
         let new_handle = self.metablock.open_handle(ino, fh, &write_mode, flags).await?;
-        let state = FileHandleState::new(fh, &new_handle, flags, self).await?;
+        let state = match FileHandleState::new(fh, &new_handle, flags, self).await {
+            Ok(state) => state,
+            Err(error) => {
+                // A failed read while seeding an append must not leave an active writer.
+                if matches!(new_handle.mode, ReadWriteMode::Write) {
+                    self.metablock.finish_writing(ino, None, fh).await?;
+                }
+                return Err(error);
+            }
+        };
         let handle = FileHandle {
             ino,
             location: new_handle.lookup.try_into_s3_location()?,
@@ -706,6 +715,9 @@ where
     }
 
     pub async fn rmdir(&self, parent_ino: InodeNo, name: &OsStr) -> Result<(), Error> {
+        if !self.config.s3_personality.supports_rename_object() && !self.config.allow_delete {
+            return Err(err!(libc::EPERM, "deleting directory markers requires --allow-delete"));
+        }
         self.metablock.rmdir(parent_ino, name).await?;
         Ok(())
     }
@@ -772,6 +784,10 @@ where
         #[cfg(not(target_os = "linux"))]
         {
             overwrites_allowed = self.config.allow_overwrite;
+        }
+
+        if !self.config.s3_personality.supports_rename_object() && !self.config.allow_delete {
+            return Err(err!(libc::EPERM, "copy/delete rename requires --allow-delete"));
         }
 
         self.metablock
