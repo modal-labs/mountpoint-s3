@@ -1702,3 +1702,139 @@ async fn test_rename_support_is_cached() {
     assert_eq!(err.to_errno(), libc::ENOSYS, "rename should again fail with ENOSYS");
     assert_eq!(counter.count(), 1, "The second failed rename should have been cached");
 }
+
+fn make_express_test_filesystem(incremental_upload: bool) -> (Arc<MockClient>, S3Filesystem<Arc<MockClient>>) {
+    let part_size = 1024 * 1024;
+    let client = Arc::new(
+        MockClient::config()
+            .bucket("bucket")
+            .part_size(part_size)
+            .enable_backpressure(true)
+            .initial_read_window_size(256 * 1024)
+            .enable_rename(true)
+            .build(),
+    );
+    let config = S3FilesystemConfig {
+        allow_overwrite: true,
+        allow_delete: true,
+        incremental_upload,
+        s3_personality: S3Personality::ExpressOneZone,
+        ..Default::default()
+    };
+    let fs = make_test_filesystem_with_client(
+        client.clone(),
+        PagedPool::new_with_candidate_sizes([part_size]),
+        "bucket",
+        &Default::default(),
+        config,
+    );
+    (client, fs)
+}
+
+#[test_case::test_matrix(["", "contents"], [false, true], [false, true])]
+#[tokio::test]
+async fn test_express_rename_unlink_after_flush(contents: &str, unlink: bool, incremental_upload: bool) {
+    let (client, fs) = make_express_test_filesystem(incremental_upload);
+    let ino = fs
+        .mknod(FUSE_ROOT_INODE, "index.lock".as_ref(), libc::S_IFREG | 0o600, 0, 0)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let fh = fs.open(ino, OpenFlags::O_WRONLY, 0).await.unwrap().fh;
+    if !contents.is_empty() {
+        fs.write(ino, fh, 0, contents.as_bytes(), 0, 0, None).await.unwrap();
+    }
+    // An active writer is still protected. Flush from a different PID defers completion.
+    assert_eq!(
+        fs.unlink(FUSE_ROOT_INODE, "index.lock".as_ref())
+            .await
+            .unwrap_err()
+            .to_errno(),
+        libc::EPERM
+    );
+    assert_eq!(
+        fs.rename(
+            FUSE_ROOT_INODE,
+            "index.lock".as_ref(),
+            FUSE_ROOT_INODE,
+            "index".as_ref(),
+            RenameFlags::empty()
+        )
+        .await
+        .unwrap_err()
+        .to_errno(),
+        libc::EPERM
+    );
+    fs.flush(ino, fh, 0, 123).await.unwrap();
+    if !incremental_upload {
+        assert!(!client.contains_key("index.lock"));
+    }
+    if unlink {
+        fs.unlink(FUSE_ROOT_INODE, "index.lock".as_ref()).await.unwrap();
+    } else {
+        fs.rename(
+            FUSE_ROOT_INODE,
+            "index.lock".as_ref(),
+            FUSE_ROOT_INODE,
+            "index".as_ref(),
+            RenameFlags::empty(),
+        )
+        .await
+        .unwrap();
+        let dest = fs.lookup(FUSE_ROOT_INODE, "index".as_ref()).await.unwrap();
+        assert_eq!(dest.attr.size, contents.len() as u64);
+        let reader = fs.open(dest.attr.ino, OpenFlags::empty(), 123).await.unwrap().fh;
+        assert_eq!(
+            &fs.read(dest.attr.ino, reader, 0, 64, 0, None).await.unwrap()[..],
+            contents.as_bytes()
+        );
+    }
+    assert!(!client.contains_key("index.lock"));
+    fs.release(ino, fh, 0, None, false).await.unwrap();
+    assert!(
+        !client.contains_key("index.lock"),
+        "late release must not recreate the old key"
+    );
+}
+
+#[test_case(false; "atomic upload")]
+#[test_case(true; "incremental upload")]
+#[tokio::test]
+async fn test_express_rename_over_flushed_destination(incremental_upload: bool) {
+    let (client, fs) = make_express_test_filesystem(incremental_upload);
+    let mut handles = Vec::new();
+    for (name, contents) in [("config.lock", "new config"), ("config", "old config")] {
+        let ino = fs
+            .mknod(FUSE_ROOT_INODE, name.as_ref(), libc::S_IFREG | 0o600, 0, 0)
+            .await
+            .unwrap()
+            .attr
+            .ino;
+        let fh = fs.open(ino, OpenFlags::O_WRONLY, 0).await.unwrap().fh;
+        fs.write(ino, fh, 0, contents.as_bytes(), 0, 0, None).await.unwrap();
+        fs.flush(ino, fh, 0, 123).await.unwrap();
+        handles.push((ino, fh));
+    }
+    fs.rename(
+        FUSE_ROOT_INODE,
+        "config.lock".as_ref(),
+        FUSE_ROOT_INODE,
+        "config".as_ref(),
+        RenameFlags::empty(),
+    )
+    .await
+    .unwrap();
+    // Neither late release may recreate the source or overwrite the destination.
+    for (ino, fh) in handles {
+        fs.release(ino, fh, 0, None, false).await.unwrap();
+    }
+    assert!(!client.contains_key("config.lock"));
+    let dest = fs.lookup(FUSE_ROOT_INODE, "config".as_ref()).await.unwrap();
+    let reader = fs.open(dest.attr.ino, OpenFlags::empty(), 123).await.unwrap().fh;
+    assert_eq!(
+        &fs.read(dest.attr.ino, reader, 0, 64, 0, None).await.unwrap()[..],
+        b"new config"
+    );
+    fs.release(dest.attr.ino, reader, 0, None, false).await.unwrap();
+}

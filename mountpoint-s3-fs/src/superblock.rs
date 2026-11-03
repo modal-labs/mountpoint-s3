@@ -320,6 +320,16 @@ impl<OC: ObjectClient + Send + Sync> Superblock<OC> {
         }
     }
 
+    /// Complete a flushed handle before operating on its object. Drop the inode lock
+    /// before waiting: upload completion needs it to finish writing.
+    async fn finish_pending_upload(&self, inode: &Inode) -> Result<(), InodeError> {
+        let hook = inode.get_inode_state()?.pending_upload_hook.clone();
+        if let Some(hook) = hook {
+            hook.wait_for_completion().await?;
+        }
+        Ok(())
+    }
+
     async fn new_readdir_handle_with_pagesize(&self, dir_ino: InodeNo, page_size: usize) -> Result<u64, InodeError> {
         trace!(dir=?dir_ino, "readdir");
 
@@ -467,6 +477,7 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         if src_inode.kind() == InodeKind::Directory {
             return Err(InodeError::CannotRenameDirectory(src_inode.err()));
         }
+        self.finish_pending_upload(&src_inode).await?;
         // Check write status from source and set to PendingRename
         let mut src_status_guard = PendingRenameGuard::try_transition(&src_inode)?;
 
@@ -480,6 +491,9 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             .await
             .ok()
             .map(|looked_up| looked_up.inode);
+        if let Some(inode) = &dest_inode {
+            self.finish_pending_upload(inode).await?;
+        }
         // Check if destination exists and transition to `PendingRename` state if possible.
         let dest_status_guard = dest_inode
             .as_ref()
@@ -700,6 +714,10 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
 
         if inode.kind() == InodeKind::Directory {
             return Err(InodeError::IsDirectory(inode.err()));
+        }
+
+        if self.inner.config.s3_personality.supports_rename_object() {
+            self.finish_pending_upload(&inode).await?;
         }
 
         let write_status = {

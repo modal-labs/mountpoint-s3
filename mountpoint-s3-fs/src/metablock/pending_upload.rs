@@ -15,6 +15,7 @@ use super::{InodeError, Lookup, Metablock};
 /// 3. Triggered using `wait_for_completion` by either:
 ///    - A subsequent `release` call
 ///    - A new `open` that needs to override the flushed handle
+///    - An Express `rename` or `unlink` that needs the completed object
 /// 4. Once triggered, subsequent `wait_for_completion`s return the result of the attempted upload (once available).
 #[derive(Clone, Debug)]
 pub struct PendingUploadHook {
