@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -1812,11 +1812,13 @@ where
     let source_path = main_dir.join("source.txt");
     let destination_path = main_dir.join("destination.txt");
 
-    let mut f = File::options()
-        .read(true)
-        .write(false)
-        .open(&destination_path)
-        .expect("open should succeed");
+    let mut options = File::options();
+    options.read(true);
+    // Buffered FUSE reads can translate the server's ESTALE into EIO. Test the
+    // filesystem error directly without the kernel page cache's error handling.
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_DIRECT);
+    let mut f = options.open(&destination_path).expect("open should succeed");
     f.read_exact(&mut [0u8; 1]).expect("read should succeed");
 
     fs::rename(&source_path, &destination_path).expect("should succeed if source exists and destination doesnt");

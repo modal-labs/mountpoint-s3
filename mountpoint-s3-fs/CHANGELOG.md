@@ -1,5 +1,8 @@
 ## Unreleased
 
+* Support regular-file Git workflows on general-purpose S3 buckets: copy/delete rename with `--allow-delete`, append by replacement with `--allow-overwrite`, and persistent empty directories. Rename is non-atomic and requires one writer per repository; objects larger than 5 GiB cannot be renamed.
+* Wait for deferred uploads before rename and unlink so closing an empty lockfile does not leave a stale lock.
+
 * Fix reads of objects with non-standard ETags (for example, Google Cloud Storage composite objects) failing with an I/O error. ([awslabs/aws-c-s3#664](https://github.com/awslabs/aws-c-s3/pull/664))
 * Update to latest CRT dependencies.
 

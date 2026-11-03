@@ -204,6 +204,12 @@ impl ProvideErrorMetadata for DeleteObjectError {
     }
 }
 
+impl ProvideErrorMetadata for CopyObjectError {
+    fn meta(&self) -> ClientErrorMetadata {
+        Default::default()
+    }
+}
+
 impl ProvideErrorMetadata for RenameObjectError {
     fn meta(&self) -> ClientErrorMetadata {
         Default::default()

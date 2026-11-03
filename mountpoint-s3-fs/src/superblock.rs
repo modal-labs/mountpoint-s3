@@ -31,7 +31,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::{FutureExt, select_biased};
 use mountpoint_s3_client::ObjectClient;
-use mountpoint_s3_client::error::{HeadObjectError, ObjectClientError, RenameObjectError};
+use mountpoint_s3_client::error::{CopyObjectError, HeadObjectError, ObjectClientError, RenameObjectError};
 use mountpoint_s3_client::types::{
     ETag, HeadObjectParams, HeadObjectResult, RenameObjectParams, RenamePreconditionTypes,
 };
@@ -320,6 +320,16 @@ impl<OC: ObjectClient + Send + Sync> Superblock<OC> {
         }
     }
 
+    /// Flush may defer an empty upload or a handle closed by another process.
+    /// Complete it without holding the inode lock (finish_writing needs that lock).
+    async fn finish_pending_upload(&self, inode: &Inode) -> Result<(), InodeError> {
+        let hook = inode.get_inode_state()?.pending_upload_hook.clone();
+        if let Some(hook) = hook {
+            hook.wait_for_completion().await?;
+        }
+        Ok(())
+    }
+
     async fn new_readdir_handle_with_pagesize(&self, dir_ino: InodeNo, page_size: usize) -> Result<u64, InodeError> {
         trace!(dir=?dir_ino, "readdir");
 
@@ -375,9 +385,10 @@ impl<OC: ObjectClient + Send + Sync> Superblock<OC> {
         locked_inode: &mut InodeLockedForWriting,
         inode: Inode,
         mode: &WriteMode,
-        is_truncate: bool,
+        flags: OpenFlags,
         handle_id: u64,
     ) -> Result<Option<PendingUploadHook>, InodeError> {
+        let is_truncate = flags.contains(OpenFlags::O_TRUNC);
         let setup_inode_for_writing = |locked_inode: &mut InodeLockedForWriting| -> Result<(), InodeError> {
             self.inner
                 .open_handles
@@ -397,7 +408,8 @@ impl<OC: ObjectClient + Send + Sync> Superblock<OC> {
             }
             WriteStatus::PendingRename => Err(InodeError::InodeAlreadyWriting(inode.err())),
             WriteStatus::LocalOpenForWriting | WriteStatus::Remote => {
-                if !mode.is_inode_writable(is_truncate) {
+                if !(mode.is_inode_writable(is_truncate) || mode.allow_overwrite && flags.contains(OpenFlags::O_APPEND))
+                {
                     return Err(InodeError::InodeNotWritable(inode.err()));
                 }
                 setup_inode_for_writing(locked_inode)?;
@@ -429,8 +441,8 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             .map(|lookup| lookup.into())
     }
 
-    /// Rename is only supported on Amazon S3 directory buckets supporting the RenameObject operation.
-    /// File systems against other buckets will reject `rename` file system operations within the same file system.
+    /// Rename regular files using RenameObject on directory buckets, or non-atomically
+    /// using CopyObject followed by DeleteObject on other buckets.
     ///
     /// As part of this operation, we update the local file system state.
     async fn rename(
@@ -441,15 +453,9 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         dst_name: &OsStr,
         allow_overwrite: bool,
     ) -> Result<(), InodeError> {
-        // RenameObject is only supported on S3 Express One Zone directory
-        // buckets. Non-Express backends (including MinIO) silently accept the
-        // PUT ?renameObject request as a regular PutObject, producing a
-        // corrupt/empty target while leaving the source intact.
-        if !self.inner.config.s3_personality.supports_rename_object() {
-            return Err(InodeError::RenameNotSupported());
-        }
-        // If we have cached a failed rename, we will directly fail
-        if !self.inner.cached_rename_support.should_try_rename() {
+        let native_rename = self.inner.config.s3_personality.supports_rename_object();
+        // Only cache support for the native RenameObject API.
+        if native_rename && !self.inner.cached_rename_support.should_try_rename() {
             trace!("Cached rename failure, returning NotSupported");
             return Err(InodeError::RenameNotSupported());
         }
@@ -465,8 +471,16 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             .await?
             .inode;
         if src_inode.kind() == InodeKind::Directory {
-            return Err(InodeError::CannotRenameDirectory(src_inode.err()));
+            return Err(if native_rename {
+                InodeError::CannotRenameDirectory(src_inode.err())
+            } else {
+                InodeError::RenameNotSupported()
+            });
         }
+        if src_parent_ino == dst_parent_ino && src_name == dst_name {
+            return Ok(());
+        }
+        self.finish_pending_upload(&src_inode).await?;
         // Check write status from source and set to PendingRename
         let mut src_status_guard = PendingRenameGuard::try_transition(&src_inode)?;
 
@@ -480,6 +494,12 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             .await
             .ok()
             .map(|looked_up| looked_up.inode);
+        if let Some(inode) = &dest_inode {
+            if inode.kind() == InodeKind::Directory {
+                return Err(InodeError::IsDirectory(inode.err()));
+            }
+            self.finish_pending_upload(inode).await?;
+        }
         // Check if destination exists and transition to `PendingRename` state if possible.
         let dest_status_guard = dest_inode
             .as_ref()
@@ -510,11 +530,59 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             RenameObjectParams::new().if_none_match(Some("*".to_string()))
         };
 
-        let rename_object_result = self
-            .inner
-            .client
-            .rename_object(&self.inner.s3_path.bucket, src_key.as_ref(), &dest_key, &rename_params)
-            .await;
+        let mut copied_stat = None;
+        let rename_object_result = if native_rename {
+            self.inner
+                .client
+                .rename_object(&self.inner.s3_path.bucket, src_key.as_ref(), &dest_key, &rename_params)
+                .await
+                .map(|_| ())
+        } else {
+            // This is deliberately not atomic: callers must serialize writers to a repository.
+            if src_inode.get_inode_state()?.stat.size > 5 * 1024 * 1024 * 1024 {
+                return Err(InodeError::RenameObjectTooLarge(src_inode.err()));
+            }
+            let bucket = &self.inner.s3_path.bucket;
+            self.inner
+                .client
+                .copy_object(bucket, src_key.as_ref(), bucket, &dest_key, &Default::default())
+                .await
+                .map_err(|error| match error {
+                    ObjectClientError::ServiceError(CopyObjectError::NotFound) => {
+                        InodeError::InodeDoesNotExist(src_inode.ino())
+                    }
+                    _ => InodeError::client_error(error, "CopyObject failed during rename", bucket, &dest_key),
+                })?;
+            // The copy is visible even if a subsequent HEAD or DELETE fails.
+            self.inner.negative_cache.remove(dst_parent_ino, dest_name.as_ref());
+            if let Some(inode) = &dest_inode {
+                inode.get_mut_inode_state()?.stat.update_validity(Duration::ZERO);
+            }
+            // CopyObject may change the ETag (notably for multipart sources). Refresh it
+            // before reusing the inode, otherwise immediate reads can fail If-Match.
+            let head = self
+                .inner
+                .client
+                .head_object(bucket, &dest_key, &HeadObjectParams::new())
+                .await
+                .map_err(|error| InodeError::client_error(error, "HeadObject failed after copy", bucket, &dest_key))?;
+            copied_stat = Some(InodeStat::for_file(
+                head.size as usize,
+                head.last_modified,
+                Some(head.etag.into_inner().into_boxed_str()),
+                head.storage_class.as_deref(),
+                head.restore_status,
+                self.inner.config.cache_config.file_ttl,
+            ));
+            self.inner
+                .client
+                .delete_object(bucket, src_key.as_ref())
+                .await
+                .map_err(|error| {
+                    InodeError::client_error(error, "DeleteObject failed during rename", bucket, src_key.as_ref())
+                })?;
+            Ok(())
+        };
 
         match rename_object_result {
             Ok(_res) => {
@@ -552,7 +620,9 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             }
         };
 
-        self.inner.cached_rename_support.cache_success();
+        if native_rename {
+            self.inner.cached_rename_support.cache_success();
+        }
         // Invalidate destination from negative cache, as it is now in S3
         self.inner.negative_cache.remove(
             dst_parent.ino(),
@@ -596,6 +666,10 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
                         dst_parent_ino,
                     )?;
 
+                    if let Some(stat) = copied_stat {
+                        new_inode.get_mut_inode_state()?.stat = stat;
+                    }
+
                     // Try to remove the inode from the parent, and notice if it was in an unexpected state.
                     let concurrent_modification_detected =
                         if let Some((_name, old_inode)) = children.remove_entry(dst_name_as_str.as_ref()) {
@@ -629,8 +703,7 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         Ok(())
     }
 
-    /// Remove local-only empty directory, i.e., the ones created by mkdir.
-    /// It does not affect empty directories represented remotely with directory markers.
+    /// Remove empty directories, including persisted directory markers on general-purpose buckets.
     async fn rmdir(&self, parent_ino: InodeNo, name: &OsStr) -> Result<(), InodeError> {
         let LookedUpInode { inode, .. } = self
             .inner
@@ -641,16 +714,48 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             return Err(InodeError::NotADirectory(inode.err()));
         }
 
+        let persistent_directory = !self.inner.config.s3_personality.supports_rename_object();
+        if persistent_directory {
+            {
+                let state = inode.get_inode_state()?;
+                if let InodeKindData::Directory { writing_children, .. } = &state.kind_data
+                    && !writing_children.is_empty()
+                {
+                    return Err(InodeError::DirectoryNotEmpty(inode.err()));
+                }
+            }
+            let key = self.inner.full_key_for_inode(&inode);
+            let bucket = &self.inner.s3_path.bucket;
+            // Two entries suffice: the marker itself and any child. Never delete children.
+            let listing = self
+                .inner
+                .client
+                .list_objects(bucket, None, "", 2, key.as_ref())
+                .await
+                .map_err(|error| InodeError::client_error(error, "rmdir listing failed", bucket, key.as_ref()))?;
+            if listing.next_continuation_token.is_some()
+                || !listing.common_prefixes.is_empty()
+                || listing.objects.iter().any(|object| object.key != key.as_ref())
+            {
+                return Err(InodeError::DirectoryNotEmpty(inode.err()));
+            }
+            self.inner
+                .client
+                .delete_object(bucket, key.as_ref())
+                .await
+                .map_err(|error| InodeError::client_error(error, "rmdir marker delete failed", bucket, key.as_ref()))?;
+        }
+
         let parent = self.inner.get(parent_ino)?;
         let mut parent_state = parent.get_mut_inode_state()?;
         let mut inode_state = inode.get_mut_inode_state()?;
 
         match &inode_state.write_status {
             WriteStatus::LocalOpenForWriting => unreachable!("A directory cannot be in LocalOpenForWriting state"),
-            WriteStatus::Remote => {
+            WriteStatus::Remote if !persistent_directory => {
                 return Err(InodeError::CannotRemoveRemoteDirectory(inode.err()));
             }
-            WriteStatus::LocalUnopened => match &mut inode_state.kind_data {
+            WriteStatus::LocalUnopened | WriteStatus::Remote => match &mut inode_state.kind_data {
                 InodeKindData::File {} => unreachable!("Already checked that inode is a directory"),
                 InodeKindData::Directory {
                     writing_children,
@@ -676,11 +781,7 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
                 writing_children,
                 ..
             } => {
-                let removed = writing_children.remove(&inode.ino());
-                debug_assert!(
-                    removed,
-                    "should be able to remove the directory from its parents writing children as it was local"
-                );
+                writing_children.remove(&inode.ino());
                 children.remove(inode.name());
             }
         }
@@ -701,6 +802,8 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         if inode.kind() == InodeKind::Directory {
             return Err(InodeError::IsDirectory(inode.err()));
         }
+
+        self.finish_pending_upload(&inode).await?;
 
         let write_status = {
             let inode_state = inode.get_inode_state()?;
@@ -844,7 +947,8 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         let mode = if flags.contains(OpenFlags::O_RDWR) {
             if looked_up_inode.write_status == WriteStatus::LocalUnopened
                 || (write_mode.allow_overwrite && flags.contains(OpenFlags::O_TRUNC))
-                || (write_mode.incremental_upload && flags.contains(OpenFlags::O_APPEND))
+                || ((write_mode.incremental_upload || write_mode.allow_overwrite)
+                    && flags.contains(OpenFlags::O_APPEND))
             {
                 // If the file is new, or if it was opened in truncate or in append mode,
                 // we know it should be a write handle.
@@ -873,10 +977,7 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
 
             let pending_upload_hook = match mode {
                 ReadWriteMode::Read => self.start_reading(&mut locked_inode, inode.clone(), fh)?,
-                ReadWriteMode::Write => {
-                    let is_truncate = flags.contains(OpenFlags::O_TRUNC);
-                    self.start_writing(&mut locked_inode, inode.clone(), write_mode, is_truncate, fh)?
-                }
+                ReadWriteMode::Write => self.start_writing(&mut locked_inode, inode.clone(), write_mode, flags, fh)?,
             };
 
             let inode_lookup = Lookup::new(
@@ -1271,6 +1372,30 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
 
         // Should be impossible to fail since [lookup] does this check, but let's be sure
         let name: ValidName = name.try_into()?;
+
+        if kind == InodeKind::Directory && !self.inner.config.s3_personality.supports_rename_object() {
+            // Empty directories (including .git/refs after gc) must survive a remount.
+            let parent = self.inner.get(dir)?;
+            let key = self
+                .inner
+                .full_key_for_inode(&parent)
+                .new_child(name, kind)
+                .map_err(|_| InodeError::NotADirectory(parent.err()))?;
+            let bucket = &self.inner.s3_path.bucket;
+            self.inner
+                .client
+                .put_object_single(bucket, key.as_ref(), &Default::default(), b"")
+                .await
+                .map_err(|error| InodeError::client_error(error, "mkdir marker upload failed", bucket, key.as_ref()))?;
+            let remote = RemoteLookup {
+                kind,
+                stat: InodeStat::for_directory(self.inner.mount_time, self.inner.config.cache_config.dir_ttl),
+            };
+            let lookup = self.inner.update_from_remote(dir, name, Some(remote))?;
+            self.inner.negative_cache.remove(dir, &name);
+            self.inner.remember(&lookup.inode);
+            return Ok(lookup.into());
+        }
 
         // Put inode creation in a block so we don't hold the lock on the parent state longer than needed.
         let (lookup, inode) = {
@@ -2701,7 +2826,14 @@ mod tests {
                 .build(),
         );
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new(client.clone(), S3Path::new(bucket, prefix.clone()), Default::default());
+        let superblock = Superblock::new(
+            client.clone(),
+            S3Path::new(bucket, prefix.clone()),
+            SuperblockConfig {
+                s3_personality: S3Personality::ExpressOneZone,
+                ..Default::default()
+            },
+        );
 
         // Create local directory
         let dirname = "local_dir";
@@ -3041,7 +3173,10 @@ mod tests {
         let superblock = Superblock::new(
             client.clone(),
             S3Path::new(bucket, Default::default()),
-            Default::default(),
+            SuperblockConfig {
+                s3_personality: S3Personality::ExpressOneZone,
+                ..Default::default()
+            },
         );
 
         let nested_dirs = (0..5).map(|i| format!("level{i}")).collect::<Vec<_>>();

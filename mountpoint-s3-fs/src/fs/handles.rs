@@ -110,10 +110,34 @@ where
                         written_bytes: 0,
                     }
                 } else {
-                    let request = fs
+                    let mut request = fs
                         .uploader
-                        .start_atomic_upload(bucket.to_string(), full_key.into())
+                        .start_atomic_upload(bucket.to_string(), full_key.to_string())
                         .map_err(|e| err!(libc::EIO, source:e, "put failed to start"))?;
+                    if flags.contains(OpenFlags::O_APPEND) && !is_truncate && stat.size > 0 {
+                        // General-purpose buckets have no append API. Seed a replacement
+                        // upload with the existing object, then accept sequential writes at EOF.
+                        let etag = stat
+                            .etag
+                            .as_ref()
+                            .ok_or_else(|| err!(libc::EBADF, "no E-Tag for append"))?;
+                        let mut source = fs.prefetcher.prefetch(
+                            bucket.to_string(),
+                            ObjectId::new(full_key.into(), etag.as_ref().into()),
+                            HandleId::new(fh),
+                            stat.size as u64,
+                        );
+                        let mut offset = 0;
+                        while offset < stat.size {
+                            let bytes = source
+                                .read(offset as u64, (stat.size - offset).min(1024 * 1024))
+                                .await?
+                                .into_bytes()
+                                .map_err(|e| err!(libc::EIO, source:e, "append integrity error"))?;
+                            request.write(offset as i64, &bytes).await?;
+                            offset += bytes.len();
+                        }
+                    }
                     UploadState::MPUInProgress { request }
                 };
                 let handle = FileHandleState::Write {

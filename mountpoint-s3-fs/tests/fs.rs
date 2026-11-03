@@ -976,7 +976,14 @@ async fn test_lookup_removes_old_children(key: &str) {
 #[tokio::test]
 async fn test_local_dir(prefix: &str) {
     let prefix = Prefix::new(prefix).expect("valid prefix");
-    let (client, fs) = make_test_filesystem("test_local_dir", &prefix, Default::default());
+    let (client, fs) = make_test_filesystem(
+        "test_local_dir",
+        &prefix,
+        S3FilesystemConfig {
+            s3_personality: S3Personality::ExpressOneZone,
+            ..Default::default()
+        },
+    );
 
     // Create local directory
     let dirname = "local";
@@ -1701,4 +1708,355 @@ async fn test_rename_support_is_cached() {
         .expect_err("rename should fail");
     assert_eq!(err.to_errno(), libc::ENOSYS, "rename should again fail with ENOSYS");
     assert_eq!(counter.count(), 1, "The second failed rename should have been cached");
+}
+
+#[test_case(false; "negative destination cache")]
+#[test_case(true; "overwrite cached destination")]
+#[tokio::test]
+async fn test_copy_rename_with_cache(overwrite: bool) {
+    let prefix = Prefix::new("copy-rename/").unwrap();
+    let config = S3FilesystemConfig {
+        allow_overwrite: true,
+        allow_delete: true,
+        cache_config: CacheConfig {
+            serve_lookup_from_cache: true,
+            file_ttl: Duration::from_secs(600),
+            dir_ttl: Duration::from_secs(600),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (client, fs) = make_test_filesystem("bucket", &prefix, config);
+    client.add_object(
+        "copy-rename/source",
+        MockObject::from_bytes(b"new contents", ETag::from_str("new").unwrap()),
+    );
+    if overwrite {
+        client.add_object(
+            "copy-rename/dest",
+            MockObject::from_bytes(b"old", ETag::from_str("old").unwrap()),
+        );
+    }
+    let source = fs.lookup(FUSE_ROOT_INODE, "source".as_ref()).await.unwrap();
+    assert_eq!(fs.lookup(FUSE_ROOT_INODE, "dest".as_ref()).await.is_ok(), overwrite);
+    fs.rename(
+        FUSE_ROOT_INODE,
+        "source".as_ref(),
+        FUSE_ROOT_INODE,
+        "dest".as_ref(),
+        RenameFlags::empty(),
+    )
+    .await
+    .unwrap();
+    assert!(!client.contains_key("copy-rename/source"));
+    assert!(client.contains_key("copy-rename/dest"));
+    assert_eq!(
+        fs.lookup(FUSE_ROOT_INODE, "source".as_ref())
+            .await
+            .unwrap_err()
+            .to_errno(),
+        libc::ENOENT
+    );
+    let dest = fs.lookup(FUSE_ROOT_INODE, "dest".as_ref()).await.unwrap();
+    assert_eq!(dest.attr.ino, source.attr.ino);
+    assert_eq!(fs.getattr(dest.attr.ino).await.unwrap().attr.size, 12);
+    let fh = fs.open(dest.attr.ino, OpenFlags::empty(), 0).await.unwrap().fh;
+    assert_eq!(
+        &fs.read(dest.attr.ino, fh, 0, 64, 0, None).await.unwrap()[..],
+        b"new contents"
+    );
+    let dh = fs.opendir(FUSE_ROOT_INODE, 0).await.unwrap().fh;
+    let mut reply = DirectoryReply::default();
+    fs.readdirplus(FUSE_ROOT_INODE, dh, 0, &mut reply).await.unwrap();
+    let names: Vec<_> = reply.entries.iter().map(|entry| entry.name.to_str().unwrap()).collect();
+    assert!(names.contains(&"dest"));
+    assert!(!names.contains(&"source"));
+}
+
+#[test_case("", false; "empty rename")]
+#[test_case("contents", false; "deferred nonempty rename")]
+#[test_case("", true; "empty unlink")]
+#[test_case("contents", true; "deferred nonempty unlink")]
+#[tokio::test]
+async fn test_rename_unlink_after_flush_before_release(contents: &str, unlink: bool) {
+    let config = S3FilesystemConfig {
+        allow_overwrite: true,
+        allow_delete: true,
+        ..Default::default()
+    };
+    let (client, fs) = make_test_filesystem("bucket", &Default::default(), config);
+    let ino = fs
+        .mknod(FUSE_ROOT_INODE, "index.lock".as_ref(), libc::S_IFREG | 0o600, 0, 0)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let fh = fs.open(ino, OpenFlags::O_WRONLY, 0).await.unwrap().fh;
+    if !contents.is_empty() {
+        fs.write(ino, fh, 0, contents.as_bytes(), 0, 0, None).await.unwrap();
+    }
+    // An active writer is still protected. Flush from a different PID defers completion.
+    assert_eq!(
+        fs.unlink(FUSE_ROOT_INODE, "index.lock".as_ref())
+            .await
+            .unwrap_err()
+            .to_errno(),
+        libc::EPERM
+    );
+    assert_eq!(
+        fs.rename(
+            FUSE_ROOT_INODE,
+            "index.lock".as_ref(),
+            FUSE_ROOT_INODE,
+            "index".as_ref(),
+            RenameFlags::empty()
+        )
+        .await
+        .unwrap_err()
+        .to_errno(),
+        libc::EPERM
+    );
+    fs.flush(ino, fh, 0, 123).await.unwrap();
+    assert!(!client.contains_key("index.lock"));
+    if unlink {
+        fs.unlink(FUSE_ROOT_INODE, "index.lock".as_ref()).await.unwrap();
+    } else {
+        fs.rename(
+            FUSE_ROOT_INODE,
+            "index.lock".as_ref(),
+            FUSE_ROOT_INODE,
+            "index".as_ref(),
+            RenameFlags::empty(),
+        )
+        .await
+        .unwrap();
+        let dest = fs.lookup(FUSE_ROOT_INODE, "index".as_ref()).await.unwrap();
+        assert_eq!(dest.attr.size, contents.len() as u64);
+        let reader = fs.open(dest.attr.ino, OpenFlags::empty(), 123).await.unwrap().fh;
+        assert_eq!(
+            &fs.read(dest.attr.ino, reader, 0, 64, 0, None).await.unwrap()[..],
+            contents.as_bytes()
+        );
+    }
+    assert!(!client.contains_key("index.lock"));
+    fs.release(ino, fh, 0, None, false).await.unwrap();
+    assert!(
+        !client.contains_key("index.lock"),
+        "late release must not recreate the old key"
+    );
+}
+
+#[tokio::test]
+async fn test_copy_rename_size_limit() {
+    let (client, fs) = make_test_filesystem(
+        "bucket",
+        &Default::default(),
+        S3FilesystemConfig {
+            allow_delete: true,
+            ..Default::default()
+        },
+    );
+    client.add_object(
+        "large",
+        MockObject::constant(0, 5 * 1024 * 1024 * 1024 + 1, ETag::for_tests()),
+    );
+    let err = fs
+        .rename(
+            FUSE_ROOT_INODE,
+            "large".as_ref(),
+            FUSE_ROOT_INODE,
+            "dest".as_ref(),
+            RenameFlags::empty(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_errno(), libc::EFBIG);
+    assert!(client.contains_key("large"));
+    assert!(!client.contains_key("dest"));
+}
+
+#[test_case(0, OpenFlags::O_WRONLY; "empty")]
+#[test_case(7, OpenFlags::O_WRONLY; "reflog")]
+#[test_case(2 * 1024 * 1024 + 19, OpenFlags::O_WRONLY; "streamed prefix")]
+#[test_case(7, OpenFlags::O_RDWR; "read write append")]
+#[tokio::test]
+async fn test_append_by_replacement(initial_size: usize, access: OpenFlags) {
+    let config = S3FilesystemConfig {
+        allow_overwrite: true,
+        ..Default::default()
+    };
+    let (client, fs) = make_test_filesystem("bucket", &Default::default(), config);
+    let mut expected = vec![0xaa; initial_size];
+    client.add_object("reflog", MockObject::from_bytes(&expected, ETag::for_tests()));
+    let ino = fs.lookup(FUSE_ROOT_INODE, "reflog".as_ref()).await.unwrap().attr.ino;
+    for tail in [b"first\n".as_slice(), b"second\n".as_slice()] {
+        let fh = fs
+            .open(ino, access | OpenFlags::O_APPEND, std::process::id())
+            .await
+            .unwrap()
+            .fh;
+        fs.write(ino, fh, expected.len() as i64, tail, 0, 0, None)
+            .await
+            .unwrap();
+        fs.flush(ino, fh, 0, std::process::id()).await.unwrap();
+        fs.release(ino, fh, 0, None, false).await.unwrap();
+        expected.extend_from_slice(tail);
+        assert_eq!(fs.getattr(ino).await.unwrap().attr.size, expected.len() as u64);
+    }
+    let fh = fs.open(ino, OpenFlags::empty(), 0).await.unwrap().fh;
+    assert_eq!(
+        &fs.read(ino, fh, 0, expected.len() as u32, 0, None).await.unwrap()[..],
+        expected
+    );
+}
+
+#[tokio::test]
+async fn test_append_read_failure_preserves_source_and_releases_writer() {
+    use mountpoint_s3_client::error::ObjectClientError;
+    use mountpoint_s3_client::failure_client::GetObjectFailureMode;
+    let client = Arc::new(
+        MockClient::config()
+            .bucket("bucket")
+            .part_size(1024 * 1024)
+            .enable_backpressure(true)
+            .initial_read_window_size(256 * 1024)
+            .build(),
+    );
+    client.add_object("reflog", MockObject::from_bytes(b"original", ETag::for_tests()));
+    let failure_client = countdown_failure_client(
+        client.clone(),
+        CountdownFailureConfig {
+            get_failures: HashMap::from([(
+                1,
+                GetObjectFailureMode::OperationError(ObjectClientError::ClientError(MockClientError(
+                    "injected read failure".into(),
+                ))),
+            )]),
+            ..Default::default()
+        },
+    );
+    let fs = make_test_filesystem_with_client(
+        Arc::new(failure_client),
+        PagedPool::new_with_candidate_sizes([1024 * 1024]),
+        "bucket",
+        &Default::default(),
+        S3FilesystemConfig {
+            allow_overwrite: true,
+            ..Default::default()
+        },
+    );
+    let ino = fs.lookup(FUSE_ROOT_INODE, "reflog".as_ref()).await.unwrap().attr.ino;
+    assert!(
+        fs.open(ino, OpenFlags::O_WRONLY | OpenFlags::O_APPEND, 0)
+            .await
+            .is_err()
+    );
+    let fh = fs.open(ino, OpenFlags::empty(), 0).await.unwrap().fh;
+    assert_eq!(&fs.read(ino, fh, 0, 64, 0, None).await.unwrap()[..], b"original");
+    fs.release(ino, fh, 0, None, false).await.unwrap();
+    fs.open(ino, OpenFlags::O_WRONLY | OpenFlags::O_APPEND, 0)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_empty_directory_markers_survive_remount() {
+    let config = S3FilesystemConfig {
+        allow_delete: true,
+        ..Default::default()
+    };
+    let prefix = Prefix::new("repo/").unwrap();
+    let (client, fs) = make_test_filesystem(
+        "bucket",
+        &prefix,
+        S3FilesystemConfig {
+            allow_delete: true,
+            ..Default::default()
+        },
+    );
+    let refs = fs
+        .mkdir(FUSE_ROOT_INODE, "refs".as_ref(), 0o755, 0)
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    assert!(client.contains_key("repo/refs/"));
+    // An unuploaded child must prevent removing the remote directory marker.
+    fs.mknod(refs, "index.lock".as_ref(), libc::S_IFREG | 0o600, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.rmdir(FUSE_ROOT_INODE, "refs".as_ref()).await.unwrap_err().to_errno(),
+        libc::ENOTEMPTY
+    );
+    assert!(client.contains_key("repo/refs/"));
+    drop(fs);
+    let remounted = make_test_filesystem_with_client(
+        client.clone(),
+        PagedPool::new_with_candidate_sizes([1024 * 1024]),
+        "bucket",
+        &prefix,
+        config,
+    );
+    let refs = remounted
+        .lookup(FUSE_ROOT_INODE, "refs".as_ref())
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let dh = remounted.opendir(refs, 0).await.unwrap().fh;
+    let mut reply = DirectoryReply::default();
+    remounted.readdirplus(refs, dh, 0, &mut reply).await.unwrap();
+    assert_eq!(reply.entries.len(), 2, "the marker must not appear as a child");
+    client.add_object("repo/refs/master", MockObject::from_bytes(b"ref", ETag::for_tests()));
+    assert_eq!(
+        remounted
+            .rmdir(FUSE_ROOT_INODE, "refs".as_ref())
+            .await
+            .unwrap_err()
+            .to_errno(),
+        libc::ENOTEMPTY
+    );
+    assert!(client.contains_key("repo/refs/master"));
+    remounted.unlink(refs, "master".as_ref()).await.unwrap();
+    assert!(
+        client.contains_key("repo/refs/"),
+        "packing the last ref must retain refs/"
+    );
+    remounted.rmdir(FUSE_ROOT_INODE, "refs".as_ref()).await.unwrap();
+    assert!(!client.contains_key("repo/refs/"));
+    assert_eq!(
+        remounted
+            .lookup(FUSE_ROOT_INODE, "refs".as_ref())
+            .await
+            .unwrap_err()
+            .to_errno(),
+        libc::ENOENT
+    );
+}
+
+#[tokio::test]
+async fn test_copy_rename_requires_allow_delete() {
+    let (client, fs) = make_test_filesystem(
+        "bucket",
+        &Default::default(),
+        S3FilesystemConfig {
+            allow_overwrite: true,
+            ..Default::default()
+        },
+    );
+    client.add_object("source", MockObject::from_bytes(b"contents", ETag::for_tests()));
+    let err = fs
+        .rename(
+            FUSE_ROOT_INODE,
+            "source".as_ref(),
+            FUSE_ROOT_INODE,
+            "dest".as_ref(),
+            RenameFlags::empty(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_errno(), libc::EPERM);
+    assert!(client.contains_key("source"));
+    assert!(!client.contains_key("dest"));
 }
