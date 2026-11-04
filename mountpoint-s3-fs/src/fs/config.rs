@@ -51,6 +51,8 @@ pub struct S3FilesystemConfig {
     pub allow_rename: bool,
     /// Enable incremental uploads
     pub incremental_upload: bool,
+    /// Opt-in local staging for newly created/truncated files (Express only).
+    pub experimental_write_cache: Option<std::path::PathBuf>,
     /// Storage class to be used for new object uploads
     pub storage_class: Option<String>,
     /// S3 personality (for different S3 semantics)
@@ -87,6 +89,7 @@ impl Default for S3FilesystemConfig {
             allow_delete: false,
             allow_overwrite: false,
             incremental_upload: false,
+            experimental_write_cache: None,
             allow_rename: true,
             storage_class: None,
             s3_personality: S3Personality::default(),

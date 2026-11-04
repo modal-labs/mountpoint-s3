@@ -37,6 +37,7 @@ mod flags;
 pub use flags::{OpenFlags, RenameFlags};
 
 mod handles;
+mod staging;
 pub use handles::{FileHandle, FileHandleState};
 
 mod sse;
@@ -54,7 +55,8 @@ where
     config: S3FilesystemConfig,
     metablock: Arc<dyn Metablock>,
     prefetcher: Prefetcher<Client>,
-    uploader: Uploader<Client>,
+    uploader: Arc<Uploader<Client>>,
+    staged_files: AsyncMutex<HashMap<InodeNo, staging::StagedFileRef>>,
     next_handle: AtomicU64,
     file_handles: AsyncRwLock<HashMap<u64, Arc<FileHandle<Client>>>>,
 }
@@ -167,7 +169,8 @@ where
             config,
             metablock: Arc::new(metablock),
             prefetcher,
-            uploader,
+            uploader: Arc::new(uploader),
+            staged_files: AsyncMutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             file_handles: AsyncRwLock::new(HashMap::new()),
         }
@@ -348,10 +351,69 @@ where
             return Err(err!(libc::EINVAL, "O_SYNC and O_DSYNC are not supported"));
         }
 
+        // Serialize opens while registering a staged writer, so a concurrent reader cannot
+        // miss its backing file between the superblock transition and handle creation.
+        let mut staged_files = if self.config.experimental_write_cache.is_some() {
+            Some(self.staged_files.lock().await)
+        } else {
+            None
+        };
+        if let Some(files) = &mut staged_files {
+            if let Some((file, location)) = files
+                .get(&ino)
+                .and_then(|entry| entry.file.upgrade().map(|file| (file, entry.location.clone())))
+            {
+                if file.lock().await.completed {
+                    files.remove(&ino);
+                } else if !flags.intersects(OpenFlags::O_WRONLY | OpenFlags::O_RDWR) {
+                    let fh = self.next_handle();
+                    let handle = FileHandle {
+                        ino,
+                        location,
+                        open_pid: pid,
+                        state: AsyncMutex::new(FileHandleState::StagedRead { file }),
+                    };
+                    self.file_handles.write().await.insert(fh, Arc::new(handle));
+                    metrics::gauge!("fs.current_handles", "type" => "read").increment(1.0);
+                    return Ok(Opened {
+                        fh,
+                        flags: FOPEN_DIRECT_IO,
+                    });
+                }
+            } else {
+                files.remove(&ino);
+            }
+        }
         let fh = self.next_handle(); // TODO: can we delay obtaining the next handle until we know we are creating a new file handle?
         let write_mode = self.config.write_mode();
         let new_handle = self.metablock.open_handle(ino, fh, &write_mode, flags).await?;
-        let state = FileHandleState::new(fh, &new_handle, flags, self).await?;
+        let state = match FileHandleState::new(fh, &new_handle, flags, self).await {
+            Ok(state) => state,
+            Err(error) => {
+                if matches!(new_handle.mode, ReadWriteMode::Write) {
+                    self.metablock.finish_writing(ino, None, fh).await?;
+                }
+                return Err(error);
+            }
+        };
+        let staged = if let FileHandleState::Write {
+            state: handles::UploadState::Staged(upload),
+            ..
+        } = &state
+        {
+            if let Some(files) = &mut staged_files {
+                files.insert(
+                    ino,
+                    staging::StagedFileRef {
+                        file: Arc::downgrade(&upload.file),
+                        location: new_handle.lookup.s3_location()?.clone(),
+                    },
+                );
+            }
+            true
+        } else {
+            false
+        };
         let handle = FileHandle {
             ino,
             location: new_handle.lookup.try_into_s3_location()?,
@@ -360,7 +422,11 @@ where
         };
         debug!(fh, ino, "new {:?} file handle created", new_handle.mode);
         self.file_handles.write().await.insert(fh, Arc::new(handle));
-        let reply_flags = if flags.direct_io() { FOPEN_DIRECT_IO } else { 0 };
+        let reply_flags = if staged || flags.direct_io() {
+            FOPEN_DIRECT_IO
+        } else {
+            0
+        };
         Ok(Opened { fh, flags: reply_flags })
     }
 
@@ -398,6 +464,30 @@ where
         let mut state = handle.state.lock().await;
         let (request, flushed) = match &mut *state {
             FileHandleState::Read { request, flushed } => (request, flushed),
+            FileHandleState::StagedRead { file } => {
+                return file.lock().await.read(offset, size).map_err(staging::local_error);
+            }
+            FileHandleState::Write {
+                state: handles::UploadState::Staged(upload),
+                flushed,
+            } if upload.readable => {
+                if *flushed {
+                    if !self
+                        .metablock
+                        .try_reactivate_handle(ino, fh, ReadWriteMode::Write)
+                        .await?
+                    {
+                        return Err(err!(libc::EBADF, "file handle was superseded"));
+                    }
+                    *flushed = false;
+                }
+                return upload
+                    .file
+                    .lock()
+                    .await
+                    .read(offset, size)
+                    .map_err(staging::local_error);
+            }
             FileHandleState::Write { .. } => return Err(err!(libc::EBADF, "file handle is not open for reads")),
         };
 
@@ -490,7 +580,9 @@ where
         let len = {
             let mut state = handle.state.lock().await;
             let (request, flushed) = match &mut *state {
-                FileHandleState::Read { .. } => return Err(err!(libc::EBADF, "file handle is not open for writes")),
+                FileHandleState::Read { .. } | FileHandleState::StagedRead { .. } => {
+                    return Err(err!(libc::EBADF, "file handle is not open for writes"));
+                }
                 FileHandleState::Write { state, flushed } => (state, flushed),
             };
 
@@ -593,8 +685,9 @@ where
         logging::record_name(file_handle.file_name());
         let mut state = file_handle.state.lock().await;
         match &mut *state {
-            FileHandleState::Read { .. } => {
-                return Ok(());
+            FileHandleState::Read { .. } => return Ok(()),
+            FileHandleState::StagedRead { file } => {
+                staging::StagedUpload::upload_file(file, &self.uploader, &file_handle.location).await?;
             }
             FileHandleState::Write { state, .. } => {
                 state.commit(self, file_handle.clone(), fh).await.map_err(|e|
@@ -642,6 +735,7 @@ where
         logging::record_name(file_handle.file_name());
         let mut state = file_handle.state.lock().await;
         match &mut *state {
+            FileHandleState::StagedRead { .. } => return Ok(()),
             FileHandleState::Read { flushed, .. } => {
                 self.metablock.flush_reader(ino, fh).await?;
                 *flushed = true;
@@ -678,6 +772,10 @@ where
         logging::record_name(file_handle.file_name());
 
         match &*file_handle.state.lock().await {
+            FileHandleState::StagedRead { .. } => {
+                metrics::gauge!("fs.current_handles", "type" => "read").decrement(1.0);
+                return Ok(());
+            }
             FileHandleState::Read { .. } => {
                 metrics::gauge!("fs.current_handles", "type" => "read").decrement(1.0);
                 self.metablock.finish_reading(file_handle.ino, fh).await?;
@@ -697,15 +795,33 @@ where
         // completed (if it's not already) to upload data to S3, and mark the file handle closed
         // and the inode "Remote".
         let pending_upload_hook = PendingUploadHook::new(self.metablock.clone(), file_handle.clone(), fh);
-        self.metablock
+        let result = self
+            .metablock
             .release_writer(ino, fh, pending_upload_hook, &file_handle.location)
-            .await?;
+            .await;
+
+        if self.config.experimental_write_cache.is_some() {
+            let mut files = self.staged_files.lock().await;
+            if let Some(entry) = files.get(&ino) {
+                let completed = match entry.file.upgrade() {
+                    Some(file) => file.lock().await.completed,
+                    None => true,
+                };
+                if completed {
+                    files.remove(&ino);
+                }
+            }
+        }
 
         metrics::gauge!("fs.current_handles", "type" => "write").decrement(1.0);
+        result?;
         Ok(())
     }
 
     pub async fn rmdir(&self, parent_ino: InodeNo, name: &OsStr) -> Result<(), Error> {
+        if self.config.experimental_write_cache.is_some() && !self.config.allow_delete {
+            return Err(err!(libc::EPERM, "directory marker deletion requires --allow-delete"));
+        }
         self.metablock.rmdir(parent_ino, name).await?;
         Ok(())
     }
@@ -823,6 +939,7 @@ mod tests {
             SuperblockConfig {
                 cache_config: fs_config.cache_config.clone(),
                 s3_personality: fs_config.s3_personality,
+                ..Default::default()
             },
         );
         let mut fs = S3Filesystem::new(client, prefetcher_builder, pool, runtime, superblock, fs_config);
@@ -843,7 +960,8 @@ mod tests {
             .expect("open before the corruption should succeed");
 
         // Open a file for write in "dir1" after corruption
-        fs.uploader
+        Arc::get_mut(&mut fs.uploader)
+            .unwrap()
             .corrupt_sse(Some("aws:kmr".to_owned()), Some("some_key_alias".to_owned()));
         let dentry = fs
             .mknod(dir_ino, "file3.bin".as_ref(), libc::S_IFREG | libc::S_IRWXU, 0, 0)
@@ -1086,6 +1204,7 @@ mod tests {
             SuperblockConfig {
                 cache_config: fs_config.cache_config.clone(),
                 s3_personality: fs_config.s3_personality,
+                ..Default::default()
             },
         );
         S3Filesystem::new(client, prefetcher_builder, pool, runtime, superblock, fs_config)

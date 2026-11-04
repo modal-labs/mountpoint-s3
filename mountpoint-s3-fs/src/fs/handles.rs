@@ -11,6 +11,7 @@ use crate::prefetch::{HandleId, PrefetchGetObject};
 use crate::sync::{Arc, AsyncMutex};
 use crate::upload::{AppendUploadRequest, UploadRequest};
 
+use super::staging::{StagedFile, StagedUpload};
 use super::{Error, InodeNo, OpenFlags, S3Filesystem, ToErrno};
 
 #[derive(Debug)]
@@ -39,6 +40,8 @@ pub enum FileHandleState<Client>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
+    /// A reader sharing the local backing of an in-progress staged writer.
+    StagedRead { file: Arc<AsyncMutex<StagedFile>> },
     /// The file handle has been assigned as a read handle
     Read {
         request: PrefetchGetObject<Client>,
@@ -91,7 +94,15 @@ where
                 let is_truncate = flags.contains(OpenFlags::O_TRUNC);
                 let write_mode = fs.config.write_mode();
 
-                let upload_state = if write_mode.incremental_upload {
+                let upload_state = if let Some(directory) = &fs.config.experimental_write_cache
+                    && !flags.contains(OpenFlags::O_APPEND)
+                    && (is_truncate || stat.size == 0)
+                {
+                    UploadState::Staged(
+                        StagedUpload::new(directory, flags, fs.uploader.clone(), location.clone())
+                            .map_err(super::staging::local_error)?,
+                    )
+                } else if write_mode.incremental_upload {
                     let initial_etag = if is_truncate {
                         None
                     } else {
@@ -129,6 +140,7 @@ where
 
 #[derive(Debug)]
 pub enum UploadState<Client: ObjectClient + Send + Sync> {
+    Staged(StagedUpload<Client>),
     AppendInProgress {
         request: AppendUploadRequest<Client>,
         initial_etag: Option<ETag>,
@@ -155,17 +167,23 @@ where
         fh: u64,
     ) -> Result<u32, Error> {
         let result: Result<_, Error> = match self {
+            UploadState::Staged(upload) => upload
+                .file
+                .lock()
+                .await
+                .write(offset, data)
+                .map_err(super::staging::local_error),
             UploadState::AppendInProgress {
                 request, written_bytes, ..
             } => match request.write(offset as u64, data).await {
                 Ok(len) => {
                     *written_bytes += len;
-                    Ok(len)
+                    Ok((len, len))
                 }
                 Err(e) => Err(e.into()),
             },
             UploadState::MPUInProgress { request, .. } => match request.write(offset, data).await {
-                Ok(len) => Ok(len),
+                Ok(len) => Ok((len, len)),
                 Err(e) => Err(e.into()),
             },
             UploadState::Completed => {
@@ -177,17 +195,23 @@ where
         };
 
         match result {
-            Ok(len) => {
-                fs.metablock.inc_file_size(handle.ino, len).await?;
+            Ok((len, growth)) => {
+                fs.metablock.inc_file_size(handle.ino, growth).await?;
                 Ok(len as u32)
             }
             Err(e) => {
                 // Abort the request.
                 match std::mem::replace(self, UploadState::Failed(e.to_errno())) {
+                    UploadState::Staged(upload) => {
+                        upload.file.lock().await.completed = true;
+                        Self::finish_on_error(fs.metablock.clone(), handle.ino, &handle.location, fh).await;
+                    }
                     UploadState::MPUInProgress { .. } | UploadState::AppendInProgress { .. } => {
                         Self::finish_on_error(fs.metablock.clone(), handle.ino, &handle.location, fh).await;
                     }
-                    UploadState::Failed(_) | UploadState::Completed => unreachable!("checked above"),
+                    UploadState::Failed(_) | UploadState::Completed => {
+                        unreachable!("checked above")
+                    }
                 }
                 Err(e)
             }
@@ -202,6 +226,10 @@ where
         handle: Arc<FileHandle<Client>>,
         fh: u64,
     ) -> Result<(), Error> {
+        if let UploadState::Staged(upload) = self {
+            upload.upload().await?;
+            return Ok(());
+        }
         match &self {
             UploadState::Completed => return Ok(()),
             UploadState::Failed(e) => {
@@ -240,7 +268,7 @@ where
                     .await
                     .inspect_err(|e| *self = UploadState::Failed(e.to_errno()))?;
             }
-            UploadState::Failed(_) | UploadState::Completed => unreachable!("checked above"),
+            UploadState::Staged(_) | UploadState::Failed(_) | UploadState::Completed => unreachable!("checked above"),
         }
         Ok(())
     }
@@ -257,6 +285,12 @@ where
         fh: u64,
     ) -> Result<(), Error> {
         match self {
+            UploadState::Staged(upload) => {
+                if upload.file.lock().await.is_empty() || !are_from_same_process(open_pid, pid) {
+                    self.commit(fs, handle.clone(), fh).await?;
+                    return Self::flush_writer(fs, handle.ino, handle.clone(), fh).await;
+                }
+            }
             UploadState::AppendInProgress { written_bytes, .. } => {
                 if *written_bytes == 0 || !are_from_same_process(open_pid, pid) {
                     // Commit current changes. But don't close the write handle, only mark it as flushed
@@ -288,6 +322,11 @@ where
         };
 
         match std::mem::replace(self, UploadState::Completed) {
+            UploadState::Staged(upload) => {
+                Self::complete_staged(fs.metablock.clone(), handle.ino, &handle.location, upload, fh)
+                    .await
+                    .inspect_err(|e| *self = UploadState::Failed(e.to_errno()))?
+            }
             UploadState::AppendInProgress {
                 request, initial_etag, ..
             } => Self::complete_append(
@@ -335,6 +374,11 @@ where
         }
 
         match std::mem::replace(self, UploadState::Completed) {
+            UploadState::Staged(upload) => Ok(Some(
+                Self::complete_staged(metablock, ino, key, upload, fh)
+                    .await
+                    .inspect_err(|e| *self = UploadState::Failed(e.to_errno()))?,
+            )),
             UploadState::AppendInProgress {
                 request, initial_etag, ..
             } => Ok(Some(
@@ -344,6 +388,24 @@ where
                 Ok(Some(Self::complete_upload(metablock, ino, key, request, fh).await?))
             }
             UploadState::Failed(_) | UploadState::Completed => unreachable!("checked above"),
+        }
+    }
+
+    async fn complete_staged(
+        metablock: Arc<dyn Metablock>,
+        ino: InodeNo,
+        key: &S3Location,
+        upload: StagedUpload<Client>,
+        fh: u64,
+    ) -> Result<Lookup, InodeError> {
+        let result = upload.upload().await;
+        upload.file.lock().await.completed = true;
+        match result {
+            Ok(etag) => metablock.finish_writing(ino, Some(etag), fh).await,
+            Err(error) => {
+                Self::finish_on_error(metablock, ino, key, fh).await;
+                Err(error)
+            }
         }
     }
 

@@ -75,6 +75,8 @@ where
         SuperblockConfig {
             cache_config: config.cache_config.clone(),
             s3_personality: config.s3_personality,
+            persist_directories: config.experimental_write_cache.is_some(),
+            server_side_encryption: config.server_side_encryption.clone(),
         },
     );
     S3Filesystem::new(client, prefetcher_builder, pool, runtime, superblock, config)

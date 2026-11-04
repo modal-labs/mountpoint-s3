@@ -228,6 +228,8 @@ where
             SuperblockConfig {
                 cache_config: filesystem_config.cache_config.clone(),
                 s3_personality: filesystem_config.s3_personality,
+                persist_directories: filesystem_config.experimental_write_cache.is_some(),
+                server_side_encryption: filesystem_config.server_side_encryption.clone(),
             },
         ),
         filesystem_config,
