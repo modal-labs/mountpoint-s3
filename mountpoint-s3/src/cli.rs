@@ -150,6 +150,11 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
     )]
     pub incremental_upload: bool,
 
+    #[clap(long, value_name = "DIR", requires_all = ["incremental_upload", "allow_overwrite", "allow_delete"],
+        help = "Experimental Express support: stage new/truncated files in DIR for reads and rewrites before close; persist empty directories",
+        help_heading = MOUNT_OPTIONS_HEADER)]
+    pub experimental_write_cache: Option<std::path::PathBuf>,
+
     #[clap(long, help = "Automatically unmount on exit", help_heading = MOUNT_OPTIONS_HEADER)]
     pub auto_unmount: bool,
 
@@ -557,6 +562,7 @@ impl CliArgs {
         filesystem_config.allow_delete = self.allow_delete;
         filesystem_config.allow_overwrite = self.allow_overwrite;
         filesystem_config.incremental_upload = self.incremental_upload;
+        filesystem_config.experimental_write_cache = self.experimental_write_cache.clone();
         filesystem_config.s3_personality = s3_personality;
         filesystem_config.server_side_encryption = sse;
         filesystem_config.cache_config = self.cache_config();

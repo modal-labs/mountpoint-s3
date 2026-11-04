@@ -47,7 +47,7 @@ use crate::metablock::{
 };
 use crate::s3::{S3Path, S3Personality};
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, RwLock};
+use crate::sync::{Arc, AsyncMutex, RwLock};
 
 mod handles_map;
 use handles_map::{InodeHandleMap, SetWriterError};
@@ -115,6 +115,7 @@ struct SuperblockInner<OC: ObjectClient + Send + Sync> {
     next_ino: AtomicU64,
     mount_time: OffsetDateTime,
     config: SuperblockConfig,
+    directory_mutation: AsyncMutex<()>,
     client: OC,
     dir_handles: RwLock<HashMap<u64, Arc<DirHandle>>>,
     next_dir_handle_id: AtomicU64,
@@ -123,6 +124,9 @@ struct SuperblockInner<OC: ObjectClient + Send + Sync> {
 /// Configuration for superblock operations
 #[derive(Debug, Clone, Default)]
 pub struct SuperblockConfig {
+    /// Persist empty directories using S3 marker objects. Opt-in with local staging.
+    pub persist_directories: bool,
+    pub server_side_encryption: crate::ServerSideEncryption,
     pub cache_config: CacheConfig,
     pub s3_personality: S3Personality,
 }
@@ -242,6 +246,7 @@ impl<OC: ObjectClient + Send + Sync> Superblock<OC> {
             next_ino: AtomicU64::new(2),
             mount_time,
             config,
+            directory_mutation: AsyncMutex::new(()),
             cached_rename_support: RenameCache::new(),
             client,
             next_dir_handle_id: AtomicU64::new(1),
@@ -451,6 +456,12 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         dst_name: &OsStr,
         allow_overwrite: bool,
     ) -> Result<(), InodeError> {
+        let _directory_guard = if self.inner.config.persist_directories {
+            Some(self.inner.directory_mutation.lock().await)
+        } else {
+            None
+        };
+
         // RenameObject is only supported on S3 Express One Zone directory
         // buckets. Non-Express backends (including MinIO) silently accept the
         // PUT ?renameObject request as a regular PutObject, producing a
@@ -643,9 +654,14 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
         Ok(())
     }
 
-    /// Remove local-only empty directory, i.e., the ones created by mkdir.
-    /// It does not affect empty directories represented remotely with directory markers.
+    /// Remove an empty directory. Remote markers are removable only in persistent-directory mode.
     async fn rmdir(&self, parent_ino: InodeNo, name: &OsStr) -> Result<(), InodeError> {
+        let _directory_guard = if self.inner.config.persist_directories {
+            Some(self.inner.directory_mutation.lock().await)
+        } else {
+            None
+        };
+
         let LookedUpInode { inode, .. } = self
             .inner
             .lookup_by_name(parent_ino, name, self.inner.config.cache_config.serve_lookup_from_cache)
@@ -655,16 +671,48 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             return Err(InodeError::NotADirectory(inode.err()));
         }
 
+        let persistent_directory = self.inner.config.persist_directories;
+        if persistent_directory {
+            {
+                let state = inode.get_inode_state()?;
+                if let InodeKindData::Directory { writing_children, .. } = &state.kind_data
+                    && !writing_children.is_empty()
+                {
+                    return Err(InodeError::DirectoryNotEmpty(inode.err()));
+                }
+            }
+            let key = self.inner.full_key_for_inode(&inode);
+            let bucket = &self.inner.s3_path.bucket;
+            // Two entries suffice: the marker itself and any child. Never delete children.
+            let listing = self
+                .inner
+                .client
+                .list_objects(bucket, None, "", 2, key.as_ref())
+                .await
+                .map_err(|error| InodeError::client_error(error, "rmdir listing failed", bucket, key.as_ref()))?;
+            if listing.next_continuation_token.is_some()
+                || !listing.common_prefixes.is_empty()
+                || listing.objects.iter().any(|object| object.key != key.as_ref())
+            {
+                return Err(InodeError::DirectoryNotEmpty(inode.err()));
+            }
+            self.inner
+                .client
+                .delete_object(bucket, key.as_ref())
+                .await
+                .map_err(|error| InodeError::client_error(error, "rmdir marker delete failed", bucket, key.as_ref()))?;
+        }
+
         let parent = self.inner.get(parent_ino)?;
         let mut parent_state = parent.get_mut_inode_state()?;
         let mut inode_state = inode.get_mut_inode_state()?;
 
         match &inode_state.write_status {
             WriteStatus::LocalOpenForWriting => unreachable!("A directory cannot be in LocalOpenForWriting state"),
-            WriteStatus::Remote => {
+            WriteStatus::Remote if !persistent_directory => {
                 return Err(InodeError::CannotRemoveRemoteDirectory(inode.err()));
             }
-            WriteStatus::LocalUnopened => match &mut inode_state.kind_data {
+            WriteStatus::LocalUnopened | WriteStatus::Remote => match &mut inode_state.kind_data {
                 InodeKindData::File {} => unreachable!("Already checked that inode is a directory"),
                 InodeKindData::Directory {
                     writing_children,
@@ -692,8 +740,8 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             } => {
                 let removed = writing_children.remove(&inode.ino());
                 debug_assert!(
-                    removed,
-                    "should be able to remove the directory from its parents writing children as it was local"
+                    persistent_directory || removed,
+                    "local directory must be a writing child"
                 );
                 children.remove(inode.name());
             }
@@ -1275,6 +1323,12 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
     }
 
     async fn create(&self, dir: InodeNo, name: &OsStr, kind: InodeKind) -> Result<Lookup, InodeError> {
+        let _directory_guard = if self.inner.config.persist_directories {
+            Some(self.inner.directory_mutation.lock().await)
+        } else {
+            None
+        };
+
         trace!(parent=?dir, ?name, "create");
 
         let existing = self
@@ -1289,6 +1343,43 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
 
         // Should be impossible to fail since [lookup] does this check, but let's be sure
         let name: ValidName = name.try_into()?;
+
+        if kind == InodeKind::Directory && self.inner.config.persist_directories {
+            // Empty directories (including .git/refs after gc) must survive a remount.
+            let parent = self.inner.get(dir)?;
+            let key = self
+                .inner
+                .full_key_for_inode(&parent)
+                .new_child(name, kind)
+                .map_err(|_| InodeError::NotADirectory(parent.err()))?;
+            let bucket = &self.inner.s3_path.bucket;
+            let (sse, kms_key) = self
+                .inner
+                .config
+                .server_side_encryption
+                .clone()
+                .into_inner()
+                .map_err(|e| InodeError::ClientError {
+                    source: Arc::new(e.into()),
+                    metadata: Default::default(),
+                })?;
+            let params = mountpoint_s3_client::types::PutObjectSingleParams::new()
+                .server_side_encryption(sse)
+                .ssekms_key_id(kms_key);
+            self.inner
+                .client
+                .put_object_single(bucket, key.as_ref(), &params, b"")
+                .await
+                .map_err(|error| InodeError::client_error(error, "mkdir marker upload failed", bucket, key.as_ref()))?;
+            let remote = RemoteLookup {
+                kind,
+                stat: InodeStat::for_directory(self.inner.mount_time, self.inner.config.cache_config.dir_ttl),
+            };
+            let lookup = self.inner.update_from_remote(dir, name, Some(remote))?;
+            self.inner.negative_cache.remove(dir, &name);
+            self.inner.remember(&lookup.inode);
+            return Ok(lookup.into());
+        }
 
         // Put inode creation in a block so we don't hold the lock on the parent state longer than needed.
         let (lookup, inode) = {
@@ -2261,6 +2352,7 @@ mod tests {
             SuperblockConfig {
                 cache_config: CacheConfig::new(TimeToLive::Duration(ttl)),
                 s3_personality: S3Personality::Standard,
+                ..Default::default()
             },
         );
 
@@ -2306,6 +2398,7 @@ mod tests {
             SuperblockConfig {
                 cache_config: CacheConfig::new(TimeToLive::Duration(ttl)),
                 s3_personality: S3Personality::Standard,
+                ..Default::default()
             },
         );
 
@@ -2425,6 +2518,7 @@ mod tests {
             SuperblockConfig {
                 cache_config: CacheConfig::new(TimeToLive::Duration(std::time::Duration::from_secs(24 * 60 * 60))),
                 s3_personality: S3Personality::Standard,
+                ..Default::default()
             },
         );
         (superblock, client)

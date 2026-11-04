@@ -213,6 +213,13 @@ fn mount(args: CliArgs, client_builder: impl ClientBuilder) -> anyhow::Result<Fu
     let bucket_description = args.bucket_description()?;
     tracing::debug!("using S3 personality {s3_personality:?} for {bucket_description}");
 
+    if let Some(directory) = &args.experimental_write_cache {
+        anyhow::ensure!(
+            s3_personality.supports_rename_object(),
+            "--experimental-write-cache requires an S3 Express bucket"
+        );
+        std::fs::create_dir_all(directory).context("create local write staging directory")?;
+    }
     let filesystem_config = args.filesystem_config(sse.clone(), s3_personality);
     let mut data_cache_config = args.data_cache_config(sse)?;
 
@@ -227,6 +234,8 @@ fn mount(args: CliArgs, client_builder: impl ClientBuilder) -> anyhow::Result<Fu
         SuperblockConfig {
             cache_config: filesystem_config.cache_config.clone(),
             s3_personality: filesystem_config.s3_personality,
+            persist_directories: filesystem_config.experimental_write_cache.is_some(),
+            server_side_encryption: filesystem_config.server_side_encryption.clone(),
         },
     );
 

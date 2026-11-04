@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Add experimental local staging for new/truncated files, including shared readers and fsync uploads, and optional persistent directory markers.
+
 * Complete deferred uploads before rename and unlink on S3 Express One Zone, fixing failures on just-closed lockfiles.
 
 * Fix reads of objects with non-standard ETags (for example, Google Cloud Storage composite objects) failing with an I/O error. ([awslabs/aws-c-s3#664](https://github.com/awslabs/aws-c-s3/pull/664))

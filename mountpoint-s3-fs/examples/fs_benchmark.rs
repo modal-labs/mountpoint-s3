@@ -174,6 +174,7 @@ fn mount_file_system(
         SuperblockConfig {
             cache_config: filesystem_config.cache_config.clone(),
             s3_personality: filesystem_config.s3_personality,
+            ..Default::default()
         },
     );
     let fs = S3Filesystem::new(client, prefetcher_builder, pool, runtime, superblock, filesystem_config);

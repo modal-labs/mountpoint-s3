@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Add opt-in `--experimental-write-cache` for S3 Express: stage new/truncated files for reads and rewrites before close, and persist empty directories. See `doc/EXPERIMENTAL_EXPRESS_GIT.md` for limits.
+
 * Fix rename and unlink failing on just-closed lockfiles in S3 Express One Zone.
 
 * Fix reads of objects with non-standard ETags (for example, Google Cloud Storage composite objects) failing with an I/O error. ([awslabs/aws-c-s3#664](https://github.com/awslabs/aws-c-s3/pull/664))
